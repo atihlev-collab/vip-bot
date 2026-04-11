@@ -3,7 +3,7 @@ import requests
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
+import os
 BOT_TOKEN = "8718087603:AAG48YxUXL6lB0h8AYb49Y4kZBAsL7KGYqg"
 API_KEY = "52b7cc336890c47b1c83710a20f6b493"
 
