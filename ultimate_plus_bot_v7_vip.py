@@ -176,19 +176,31 @@ async def monitor():
             fid = m["fixture"]["id"]
             now = datetime.now().timestamp()
 
-            if fid in sent and now - sent[fid] < 3600:
+            if fid in sent and now - sent[fid] < 300:
                 continue
 
             stats = get_stats(fid)
-            if not stats:
+
+            score, pred = analyze(m, stats if stats else None)
+
+            minute = m["fixture"]["status"]["elapsed"] or 0
+            if minute < 2:
                 continue
 
-            score, pred = analyze(m, stats)
-
-            if score >= threshold():
-                minute = m["fixture"]["status"]["elapsed"] or 0
+            if score >= 60:
                 bet = stake(score)
 
+                msg = f"{label(m)}\n\n"
+                msg += f"{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n"
+                msg += info(m) + "\n"
+                msg += f"⏱ МИНУТА: {minute}'\n"
+                msg += f"👉 {pred}\n"
+                msg += f"📊 {score}%\n"
+                msg += f"💰 {bet} лв"
+
+                await bot.send_message(chat_id=CHAT_ID, text=msg)
+
+                sent[fid] = now
                 msg = f"{label(m)}\n\n"
                 msg += f"{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n"
                 msg += info(m) + "\n"
@@ -223,7 +235,54 @@ async def monitor():
                 sent[fid] = now
 
         await asyncio.sleep(60)
+# ================= ULTRA LIVE MODE =================
 
+async def ultra_live():
+    while True:
+        try:
+            matches = get_live()
+
+            for m in matches:
+                fid = m["fixture"]["id"]
+                now = datetime.now().timestamp()
+
+                # по-кратък cooldown (10 мин)
+                if fid in sent and now - sent[fid] < 300:
+                    continue
+
+                minute = m["fixture"]["status"]["elapsed"] or 0
+
+                # играем от 5-та минута
+                if minute < 2:
+                    continue
+
+                stats = get_stats(fid)
+
+                # ако няма stats пак ще играе
+                score, pred = analyze(m, stats if stats else None)
+
+                # 🔥 по-лек филтър
+                if score < 45:
+                    continue
+
+                bet = stake(score)
+
+                msg = f"⚡ LIVE ALERT\n\n"
+                msg += f"{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n"
+                msg += info(m) + "\n"
+                msg += f"⏱ {minute}'\n"
+                msg += f"👉 {pred}\n"
+                msg += f"📊 {score}%\n"
+                msg += f"💰 {bet} лв"
+
+                await bot.send_message(chat_id=CHAT_ID, text=msg)
+
+                sent[fid] = now
+
+        except Exception as e:
+            print("LIVE ERROR:", e)
+
+        await asyncio.sleep(20)
 # ================= COMMANDS =================
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,7 +348,7 @@ def main():
     app.add_handler(CommandHandler("aggressive_mode", aggressive_mode))
 
     threading.Thread(target=lambda: asyncio.run(monitor())).start()
-
+    threading.Thread(target=lambda: asyncio.run(ultra_live())).start()
     print("🔥 SMART TOP PICKS BOT RUNNING")
 
     app.run_polling()
