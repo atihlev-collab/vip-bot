@@ -125,7 +125,7 @@ def ai_live(m, stats):
         score, pick = 85, "UNDER 2.5"
 
     # FILTER
-    if score < (80 if MODE == "SAFE" else 70):
+    if score < (80 if MODE == "SAFE" else 50):
         return None
 
     return score, pick
