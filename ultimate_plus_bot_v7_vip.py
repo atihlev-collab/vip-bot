@@ -163,6 +163,7 @@ async def monitor():
 
                 stats = get_stats(fid)
                 if not stats:
+                    print("NO STATS")
                     continue
 
                 result = ai_live(m, stats)
