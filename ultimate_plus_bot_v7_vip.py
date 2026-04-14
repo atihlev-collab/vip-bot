@@ -1,5 +1,5 @@
 
-import requests
+  import requests
 import asyncio
 import threading
 from datetime import datetime, timedelta
@@ -13,24 +13,22 @@ API_KEY = "e27351fe232d4274b553a95c2c30f99a"
 CHAT_ID = 6488122776
 BANKROLL = 100
 
-BANKROLL = 100
 MODE = "SAFE"
-
 sent_matches = {}
 
 bot = Bot(token=BOT_TOKEN)
 BASE_URL = "https://v3.football.api-sports.io"
 
-# ===== WEB APP =====
+# ===== WEB =====
 app = Flask(__name__)
 
-data = {"signals": [], "bank": BANKROLL, "mode": MODE}
+data = {"signals": [], "mode": MODE}
 
 HTML = """
 <html>
 <body style="background:#0b0f14;color:white;font-family:Arial;">
-<h2>💣 PRO BET SYSTEM</h2>
-<p>Mode: {{mode}} | Bank: {{bank}}</p>
+<h2>💣 FINAL PRO</h2>
+<p>Mode: {{mode}}</p>
 {% for s in signals %}
 <div style="background:#1f2937;margin:10px;padding:10px;">
 {{s}}
@@ -65,23 +63,6 @@ def get_live():
     except:
         return []
 
-def get_today():
-    try:
-        return requests.get(BASE_URL+"/fixtures",
-            headers={"x-apisports-key":API_KEY},
-            params={"date":bg_now().strftime("%Y-%m-%d")}).json()["response"]
-    except:
-        return []
-
-def get_tomorrow():
-    try:
-        t = bg_now() + timedelta(days=1)
-        return requests.get(BASE_URL+"/fixtures",
-            headers={"x-apisports-key":API_KEY},
-            params={"date":t.strftime("%Y-%m-%d")}).json()["response"]
-    except:
-        return []
-
 def get_stats(fid):
     try:
         return requests.get(BASE_URL+"/fixtures/statistics",
@@ -90,37 +71,19 @@ def get_stats(fid):
     except:
         return []
 
-def get_last_matches(team_id):
-    try:
-        return requests.get(BASE_URL+"/fixtures",
-            headers={"x-apisports-key":API_KEY},
-            params={"team":team_id, "last":5}).json()["response"]
-    except:
-        return []
-
 def extract(stats, key):
     for s in stats:
         if s["type"] == key:
-            try:
-                return int(str(s["value"]).replace("%", ""))
-            except:
-                return 0
+            try: return int(str(s["value"]).replace("%",""))
+            except: return 0
     return 0
 
-def avg_goals(matches):
-    if not matches:
-        return 0
-    goals = 0
-    for m in matches:
-        goals += (m["goals"]["home"] or 0)
-        goals += (m["goals"]["away"] or 0)
-    return goals / len(matches)
-
-# ===== LIVE AI =====
+# ===== AI =====
 def ai_live(m, stats):
 
     minute = m["fixture"]["status"]["elapsed"] or 0
-    total = (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0)
+    if minute < 15:
+        return None
 
     home = stats[0]["statistics"]
     away = stats[1]["statistics"]
@@ -133,84 +96,38 @@ def ai_live(m, stats):
     tempo = hs + as_
     pressure = (hs-as_)*3 + (ha-aa)/2
 
-    best_score = 0
-    best_pick = None
-    best_reason = ""
-
-    if minute > 25 and abs(pressure) > 30:
-        best_score, best_pick, best_reason = 90, ("1" if pressure > 0 else "2"), "Domination"
-
-    if minute > 20 and abs(pressure) > 20:
-        if 85 > best_score:
-            best_score, best_pick, best_reason = 85, ("NEXT GOAL HOME" if pressure > 0 else "NEXT GOAL AWAY"), "Pressure"
-
-    if hs >= 3 and as_ >= 3:
-        if 85 > best_score:
-            best_score, best_pick, best_reason = 85, "GG", "Both attacking"
-
-    if tempo >= 10 and total < 3:
-        if 85 > best_score:
-            best_score, best_pick, best_reason = 85, "OVER 2.5", "High tempo"
-
-    if tempo <= 4 and minute > 35:
-        if 85 > best_score:
-            best_score, best_pick, best_reason = 85, "UNDER 2.5", "Slow"
-
-    if abs(pressure) < 5 and tempo >= 6:
-        if 80 > best_score:
-            best_score, best_pick, best_reason = 80, "X", "Balanced"
-
-    if best_score < (85 if MODE == "SAFE" else 75):
+    # ❌ fake match
+    if tempo < 4 and minute > 30:
         return None
 
-    return best_score, best_pick, best_reason
+    score = 0
+    pick = None
 
-# ===== PREMATCH AI =====
-def prematch_ai(m):
+    # 🔥 1 / 2
+    if abs(pressure) > 25 and minute < 70:
+        score, pick = 90, ("1" if pressure > 0 else "2")
 
-    home_id = m["teams"]["home"]["id"]
-    away_id = m["teams"]["away"]["id"]
+    # ⚡ NEXT GOAL
+    elif abs(pressure) > 20:
+        score, pick = 88, ("NEXT GOAL HOME" if pressure > 0 else "NEXT GOAL AWAY")
 
-    home_matches = get_last_matches(home_id)
-    away_matches = get_last_matches(away_id)
+    # 🎯 GG
+    elif hs >= 4 and as_ >= 4:
+        score, pick = 87, "GG"
 
-    if not home_matches or not away_matches:
+    # ⚽ OVER
+    elif tempo >= 12 and minute > 25:
+        score, pick = 85, "OVER 2.5"
+
+    # ❄️ UNDER
+    elif tempo <= 4 and minute > 60:
+        score, pick = 85, "UNDER 2.5"
+
+    # FILTER
+    if score < (88 if MODE == "SAFE" else 78):
         return None
 
-    home_avg = avg_goals(home_matches)
-    away_avg = avg_goals(away_matches)
-
-    total_avg = (home_avg + away_avg) / 2
-
-    best_score = 0
-    best_pick = None
-    reason = ""
-
-    if total_avg >= 2.8:
-        best_score, best_pick, reason = 88, "OVER 2.5", "Goals"
-
-    elif total_avg <= 2.0:
-        best_score, best_pick, reason = 88, "UNDER 2.5", "Low goals"
-
-    if home_avg >= 1.2 and away_avg >= 1.2:
-        if 86 > best_score:
-            best_score, best_pick, reason = 86, "GG", "Both score"
-
-    home_form = sum((m["goals"]["home"] or 0) for m in home_matches)
-    away_form = sum((m["goals"]["away"] or 0) for m in away_matches)
-
-    if home_form > away_form + 2:
-        if 85 > best_score:
-            best_score, best_pick, reason = 85, "1", "Home form"
-
-    elif away_form > home_form + 2:
-        if 85 > best_score:
-            best_score, best_pick, reason = 85, "2", "Away form"
-
-    if best_score < (85 if MODE == "SAFE" else 75):
-        return None
-
-    return best_score, best_pick, reason
+    return score, pick
 
 # ===== COMMANDS =====
 async def safe_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,7 +151,7 @@ async def monitor():
         if is_day():
             for m in get_live():
 
-                if signals_count >= 5:
+                if signals_count >= 4:
                     break
 
                 fid = m["fixture"]["id"]
@@ -251,37 +168,15 @@ async def monitor():
                 if not result:
                     continue
 
-                score, pick, reason = result
+                score, pick = result
 
-                msg = f"⚡ LIVE\n{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n🎯 {pick}\n📊 {score}%\n📌 {reason}"
+                msg = f"⚡ LIVE\n{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n🎯 {pick}\n📊 {score}%"
 
                 await bot.send_message(chat_id=CHAT_ID, text=msg)
                 push(msg)
 
                 sent_matches[fid] = now
                 signals_count += 1
-
-        for m in get_today():
-
-            result = prematch_ai(m)
-            if not result:
-                continue
-
-            score, pick, reason = result
-
-            msg = f"🎯 PREMATCH\n{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n🎯 {pick}\n📊 {score}%\n📌 {reason}"
-
-            await bot.send_message(chat_id=CHAT_ID, text=msg)
-            push(msg)
-
-        if bg_now().hour >= 18:
-            for m in get_tomorrow():
-                hour = int(m["fixture"]["date"][11:13])
-
-                if hour < 8:
-                    msg = f"🌙 NIGHT\n{m['teams']['home']['name']} vs {m['teams']['away']['name']}\nOVER 2.5"
-                    await bot.send_message(chat_id=CHAT_ID, text=msg)
-                    push(msg)
 
         await asyncio.sleep(60)
 
@@ -293,7 +188,6 @@ def run_bot():
     app_tg.add_handler(CommandHandler("aggressive_mode", aggressive_mode))
 
     threading.Thread(target=lambda: asyncio.run(monitor())).start()
-
     app_tg.run_polling()
 
 def run_web():
@@ -301,4 +195,4 @@ def run_web():
 
 if __name__ == "__main__":
     threading.Thread(target=run_bot).start()
-    run_web()
+    run_web()      
