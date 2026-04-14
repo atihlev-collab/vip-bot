@@ -1,13 +1,12 @@
 
-
 import requests
 import asyncio
 import threading
 from datetime import datetime, timezone, timedelta
-
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
+from flask import Flask, render_template_string
+# ===== CONFIG =====
 BOT_TOKEN = "8718087603:AAHb4xWFqrmvexVGPJEgc2GmK2Z29GTCfd0"
 API_KEY = "e27351fe232d4274b553a95c2c30f99a"
 CHAT_ID = 6488122776
