@@ -12,10 +12,9 @@ from flask import Flask, render_template_string
 BOT_TOKEN = "8718087603:AAHb4xWFqrmvexVGPJEgc2GmK2Z29GTCfd0"
 API_KEY = "e27351fe232d4274b553a95c2c30f99a"
 CHAT_ID = 6488122776
-BANKROLL = 100
 
+BANKROLL = 100
 MODE = "SAFE"
-sent_matches = {}
 
 bot = Bot(token=BOT_TOKEN)
 BASE_URL = "https://v3.football.api-sports.io"
@@ -23,16 +22,23 @@ BASE_URL = "https://v3.football.api-sports.io"
 # ===== WEB =====
 app = Flask(__name__)
 
-data = {"signals": [], "mode": MODE}
+data = {
+    "signals": [],
+    "bank": BANKROLL,
+    "mode": MODE
+}
 
 HTML = """
 <html>
 <body style="background:#0b0f14;color:white;font-family:Arial;">
-<h2>💣 FINAL PRO</h2>
-<p>Mode: {{mode}}</p>
+<h2>🔥 LEVEL 100 AI</h2>
+<p>Mode: {{mode}} | Bank: {{bank}}</p>
+
 {% for s in signals %}
 <div style="background:#1f2937;margin:10px;padding:10px;">
-{{s}}
+<b>{{s.title}}</b><br>
+{{s.text}}<br>
+{{s.score}} | {{s.stake}}
 </div>
 {% endfor %}
 </body>
@@ -43,144 +49,135 @@ HTML = """
 def home():
     return render_template_string(HTML, **data)
 
-def push(text):
-    data["signals"].insert(0, text)
-    if len(data["signals"]) > 50:
-        data["signals"].pop()
-
-# ===== TIME =====
-def bg_now():
-    return datetime.utcnow() + timedelta(hours=3)
-
-def is_day():
-    return 8 <= bg_now().hour < 24
+def push_signal(title, text, score, stake):
+    data["signals"].insert(0,{
+        "title":title,
+        "text":text,
+        "score":f"{score}%",
+        "stake":f"{stake} лв"
+    })
 
 # ===== API =====
 def get_live():
     try:
         return requests.get(BASE_URL+"/fixtures",
-            headers={"x-apisports-key":API_KEY},
-            params={"live":"all"}).json()["response"]
+        headers={"x-apisports-key":API_KEY},
+        params={"live":"all"}).json()["response"]
     except:
         return []
 
 def get_stats(fid):
     try:
         return requests.get(BASE_URL+"/fixtures/statistics",
-            headers={"x-apisports-key":API_KEY},
-            params={"fixture":fid}).json()["response"]
+        headers={"x-apisports-key":API_KEY},
+        params={"fixture":fid}).json()["response"]
     except:
         return []
 
-def extract(stats, key):
+def extract(stats,key):
     for s in stats:
-        if s["type"] == key:
-            try: return int(str(s["value"]).replace("%",""))
-            except: return 0
+        if s["type"]==key:
+            try:return int(str(s["value"]).replace("%",""))
+            except:return 0
     return 0
 
 # ===== AI =====
-def ai_live(m, stats):
+def ai_engine(m, stats):
 
     minute = m["fixture"]["status"]["elapsed"] or 0
-    if minute < 15:
-        return None
+    total = (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0)
 
-    home = stats[0]["statistics"]
-    away = stats[1]["statistics"]
+    score = 75
+    pick = "OVER 1.5"
 
-    hs = extract(home,"Shots on Goal")
-    as_ = extract(away,"Shots on Goal")
-    ha = extract(home,"Dangerous Attacks")
-    aa = extract(away,"Dangerous Attacks")
+    if stats:
+        home = stats[0]["statistics"]
+        away = stats[1]["statistics"]
 
-    tempo = hs + as_
-    pressure = (hs-as_)*3 + (ha-aa)/2
+        hs = extract(home,"Shots on Goal")
+        as_ = extract(away,"Shots on Goal")
+        ha = extract(home,"Dangerous Attacks")
+        aa = extract(away,"Dangerous Attacks")
 
-    # ❌ fake match
-    if tempo < 4 and minute > 30:
-        return None
+        tempo = hs + as_
+        pressure = (hs-as_)*3 + (ha-aa)/2
 
-    score = 0
-    pick = None
+        if abs(pressure) > 25:
+            score = 85
+            pick = "1" if pressure > 0 else "2"
 
-    # 🔥 1 / 2
-    if abs(pressure) > 25 and minute < 70:
-        score, pick = 90, ("1" if pressure > 0 else "2")
+        elif tempo >= 10:
+            score = 82
+            pick = "OVER 2.5"
 
-    # ⚡ NEXT GOAL
-    elif abs(pressure) > 20:
-        score, pick = 88, ("NEXT GOAL HOME" if pressure > 0 else "NEXT GOAL AWAY")
-
-    # 🎯 GG
-    elif hs >= 4 and as_ >= 4:
-        score, pick = 87, "GG"
-
-    # ⚽ OVER
-    elif tempo >= 12 and minute > 25:
-        score, pick = 85, "OVER 2.5"
-
-    # ❄️ UNDER
-    elif tempo <= 4 and minute > 60:
-        score, pick = 85, "UNDER 2.5"
-
-    # FILTER
-    if score < (80 if MODE == "SAFE" else 50):
-        return None
+        elif tempo <= 4 and minute > 35:
+            score = 80
+            pick = "UNDER 2.5"
 
     return score, pick
+
+# ===== DECISION =====
+def decision(score):
+
+    if MODE == "SAFE":
+        return score >= 80, 0.1
+    else:
+        return score >= 75, 0.15
 
 # ===== COMMANDS =====
 async def safe_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MODE
     MODE = "SAFE"
-    data["mode"] = MODE
-    await update.message.reply_text("🟢 SAFE MODE")
+    await update.message.reply_text("🟢 SAFE MODE (80%)")
 
 async def aggressive_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MODE
     MODE = "AGGRESSIVE"
-    data["mode"] = MODE
-    await update.message.reply_text("🔥 AGGRESSIVE MODE")
+    await update.message.reply_text("🔥 AGGRESSIVE MODE (75%)")
+
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 LIVE ONLY BOT")
+
+async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔥 COMBO ACTIVE")
 
 # ===== LOOP =====
 async def monitor():
     while True:
 
-        signals_count = 0
+        matches = get_live()
 
-        if is_day():
-            for m in get_live():
+        for m in matches:
 
-                if signals_count >= 4:
-                    break
+            minute = m["fixture"]["status"]["elapsed"] or 0
+            if minute < 5:
+                continue
 
-                fid = m["fixture"]["id"]
-                now = datetime.now().timestamp()
+            stats = get_stats(m["fixture"]["id"])
 
-                if fid in sent_matches and now - sent_matches[fid] < 600:
-                    continue
+            score, pick = ai_engine(m, stats)
 
-                stats = get_stats(fid)
-                if not stats:
-                    print("NO STATS")
-                    continue
+            play, stake_pct = decision(score)
 
-                result = ai_live(m, stats)
-                if not result:
-                    continue
+            if not play:
+                continue
 
-                score, pick = result
+            stake = round(BANKROLL * stake_pct, 2)
 
-                msg = f"⚡ LIVE\n{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n🎯 {pick}\n📊 {score}%"
+            home = m["teams"]["home"]["name"]
+            away = m["teams"]["away"]["name"]
 
-                await bot.send_message(chat_id=CHAT_ID, text=msg)
-                push(msg)
+            msg = f"{home} vs {away}\n{pick}\n{score}%\nStake: {stake} лв"
 
-                sent_matches[fid] = now
-                signals_count += 1
+            try:
+                await bot.send_message(chat_id=CHAT_ID,text=msg)
+                print("SENT:", msg)
+            except Exception as e:
+                print("ERROR:", e)
 
-        await asyncio.sleep(60)
+            push_signal("LIVE",msg,score,stake)
+
+        await asyncio.sleep(30)
 
 # ===== RUN =====
 def run_bot():
@@ -188,13 +185,15 @@ def run_bot():
 
     app_tg.add_handler(CommandHandler("safe_mode", safe_mode))
     app_tg.add_handler(CommandHandler("aggressive_mode", aggressive_mode))
+    app_tg.add_handler(CommandHandler("today", today))
+    app_tg.add_handler(CommandHandler("combo", combo))
 
     threading.Thread(target=lambda: asyncio.run(monitor())).start()
+
+    print("🔥 PRO BOT RUNNING")
+
     app_tg.run_polling()
 
-def run_web():
-    app.run(host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
     run_web()
