@@ -191,9 +191,9 @@ def run_bot():
 
     threading.Thread(target=lambda: asyncio.run(monitor())).start()
 
-    print("🔥 FINAL ELITE BOT RUNNING")
+print("🔥 NEW BOT V3 ACTIVE")
 
-    app.run_polling()
+app.run_polling()
 
 if __name__ == "__main__":
     run_bot()
