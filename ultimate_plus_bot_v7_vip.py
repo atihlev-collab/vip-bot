@@ -77,35 +77,35 @@ def ai_engine(m, stats):
     # 0:0 → търсим гол
     if total == 0 and minute > 25:
         if tempo >= 6:
-            return 75, "OVER 1.5"
+            return 80, "OVER 1.5"
 
     # 1 гол → next goal
     if total == 1:
         if pressure > 20 and tempo >= 5:
-            return 75, "NEXT GOAL"
+            return 80, "NEXT GOAL"
 
     # 2+ гола → over
     if total >= 2:
         if tempo >= 7:
-            return 75, "OVER 3.5"
+            return 82, "OVER 3.5"
 
     # силен натиск
     if (hs >= 5 or as_ >= 5) and pressure > 25:
-        return 75, "NEXT GOAL"
+        return 82, "NEXT GOAL"
 
     # слаб мач
     if tempo <= 2 and minute > 65:
-        return 75, "UNDER 2.5"
+        return 80, "UNDER 2.5"
 
     return None
 
 # ===== SMART STAKE =====
 def calculate_stake(score):
-    if score >= 75:
+    if score >= 85:
         return round(BANKROLL * 0.2, 2)
-    elif score >= 75:
+    elif score >= 83:
         return round(BANKROLL * 0.15, 2)
-    elif score >= 75:
+    elif score >= 80:
         return round(BANKROLL * 0.1, 2)
     else:
         return round(BANKROLL * 0.05, 2)
