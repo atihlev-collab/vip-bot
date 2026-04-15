@@ -191,7 +191,7 @@ def run_bot():
 
     threading.Thread(target=lambda: asyncio.run(monitor())).start()
 
-print("🔥 NEW BOT V3 ACTIVE")
+print("🔥 V3 LIVE FIXED")
 
 app.run_polling()
 
