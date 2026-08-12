@@ -58,6 +58,7 @@ sent_prematch = {}
 
 team_form_cache = {}
 odds_cache = {}
+FIRST_HALF_OVER05_ODDS = {}
 standings_cache = {}
 statistics_cache = {}
 betano_market_cache = {}
@@ -572,6 +573,7 @@ def get_match_odds(fixture_id):
 
     home_over15 = None
     away_over15 = None
+    first_half_over05 = None
     over15 = None
 
     # -----------------------------------------------------
@@ -602,6 +604,40 @@ def get_match_odds(fixture_id):
 
         if not isinstance(values, list):
             continue
+
+
+        # =================================================
+        # FIRST HALF OVER 0.5
+        # =================================================
+
+        if (
+            "first half" in bet_name
+            or
+            "1st half" in bet_name
+        ):
+
+            if "goal" in bet_name:
+
+                for value in values:
+
+                    if not isinstance(
+                        value,
+                        dict
+                    ):
+                        continue
+
+                    name = clean_text(
+                        value.get("value")
+                    )
+
+                    if name.startswith(
+                        "over 0.5"
+                    ):
+
+                        first_half_over05 = safe_float(
+                            value.get("odd")
+                        )
+
 
         # =================================================
         # 1X2
@@ -803,6 +839,10 @@ def get_match_odds(fixture_id):
         time.time(),
         result
     )
+
+    FIRST_HALF_OVER05_ODDS[
+        fixture_id
+    ] = first_half_over05
 
     return result
 
@@ -2392,14 +2432,17 @@ def calculate_risk(
         risk += 10
 
     # -----------------------------------------------------
-    # VALUE
-    # -----------------------------------------------------
+    # VALUE EDGE
+    # -----------------------------------------------------                                  
 
-    if edge < 3:
-        risk += 20
+    if edge < 2:
+        risk += 25
 
-    elif edge < 6:
-        risk += 10
+    elif edge < 5:
+        risk += 15
+
+    elif edge < 8:
+        risk += 5
 
     return min(
         100,
@@ -2485,15 +2528,17 @@ def dynamic_threshold(
 
     elif risk >= 45:
 
-        threshold += 2
+        threshold += 2   
 
     # -----------------------------------------------------
-    # LATE GAME
+    # LATE GAME SAFETY                        
     # -----------------------------------------------------
 
-    if minute >= 80:
+    if minute >= 85:
+        threshold += 3
 
-        threshold -= 2
+    elif minute >= 80:
+        threshold += 1
 
     # -----------------------------------------------------
     # SAFETY LIMITS
@@ -2567,19 +2612,12 @@ class SignalManager:
         )
 
         self.signals.append({
-
             "market": market,
-
             "probability": probability,
-
             "confidence": confidence,
-
             "quality": quality,
-
             "risk": risk,
-
             "minute": minute,
-
             "score": round(
                 score,
                 2
@@ -4024,8 +4062,12 @@ def final_live_quality_gate(
         return False
 
     # Stable signal
+    # Stable signal
     if stability < 80:
+        return False
 
+    # Extra stability for borderline signals       
+    if stability < 85 and probability < 82:
         return False
 
     # At least two real confirmations
@@ -9391,6 +9433,25 @@ def live_goal_probability(
 
     )
 
+
+    # =================================================
+    # SHOTS + xG CONFIRMATION                  
+    # =================================================
+
+    if (
+        shots_on >= 3
+        and
+        xg >= 0.80
+    ):
+        probability += 5
+
+    elif (
+        shots_on >= 2
+        and
+        xg >= 0.50
+    ):
+        probability += 2
+
     # xG
 
     probability += min(
@@ -11896,16 +11957,6 @@ def startup():
 
     print()
 
-    main_loop()
-
-
-# =========================================================
-# PROGRAM ENTRY POINT
-# =========================================================
-
-if __name__ == "__main__":
-
-    startup()
 
 # =========================================================
 # PREMATCH ENGINE V4
@@ -15238,25 +15289,22 @@ def scan_live_matches():
             continue
 
     # =================================================
-    # BEST LIVE SIGNALS
+    # BEST LIVE SIGNALS                        
     # =================================================
 
     candidates.sort(
-
         key=lambda x: (
-
-            x["confidence"],
-
-            x["probability"],
-
-            x["quality"],
-
-            -x["risk"]
-
+            (
+                x["probability"] * 0.40
+                +
+                x["confidence"] * 0.35
+                +
+                x["quality"] * 0.15
+                -
+                x["risk"] * 0.10
+            )
         ),
-
         reverse=True
-
     )
 
     selected = candidates[
@@ -16574,7 +16622,72 @@ def analyze_prematch(
 
                     signal
 
+                )     
+
+
+        # =================================================
+        # UNDER 3.5
+        # =================================================
+
+        if under35_odd is not None:
+
+            probability = goals[
+                "under35"
+            ]
+
+            confidence = prematch_confidence(
+                probability,
+                home_form,
+                away_form,
+                "🛡 UNDER 3.5",
+                league_score
+            )
+
+            risk = prematch_risk(
+                probability,
+                confidence,
+                home_form,
+                away_form
+            )
+
+            signal = create_prematch_signal(
+                "🛡 UNDER 3.5",
+                probability,
+                confidence,
+                risk,
+                under35_odd,
+                home_name,
+                away_name,
+                league_name
+            )
+
+            if signal:
+                signals.append(
+                    signal
                 )
+
+
+        # -------------------------------------------------
+        # UNDER 3.5
+        # -------------------------------------------------
+
+        under35_confidence = prematch_confidence(
+            home_form,
+            away_form,
+            goal_prob["under35"]
+        )
+
+        candidate = create_prematch_candidate(
+            "🛡 UNDER 3.5",
+            goal_prob["under35"],
+            under35_odd,
+            under35_confidence
+        )
+
+        if candidate:
+            candidates.append(
+                candidate
+            )
 
         # =================================================
         # BTTS
@@ -17230,6 +17343,37 @@ def live_goal_probability(
         )
     )
 
+
+    # =================================================
+    # LOW xG SAFETY FILTER                        
+    # =================================================
+
+    if (
+        xg < 0.35
+        and
+        shots_on == 0
+    ):
+        probability -= 8
+
+    elif (
+        xg < 0.50
+        and
+        shots_on <= 1
+    ):
+        probability -= 4
+
+
+    # =================================================
+    # SHOTS ON TARGET CONFIRMATION              
+    # =================================================
+
+    if shots_on >= 4:
+        probability += 5
+
+    elif shots_on >= 2:
+        probability += 2
+
+
     # Active part of the match.
     if 55 <= minute <= 80:
 
@@ -17337,6 +17481,25 @@ def calculate_live_confidence(
 ):
 
     confidence = 50
+
+    # =====================================================
+    # LIVE MOMENTUM CHANGE                        
+    # =====================================================
+
+    if (
+        attack >= 75
+        and
+        pressure >= 75
+    ):
+        confidence += 4
+
+    elif (
+        attack >= 65
+        and
+        pressure >= 65
+    ):
+        confidence += 2
+
 
     # Probability.
     confidence += (
@@ -18283,13 +18446,13 @@ def scan_live_matches(
 
         key=lambda x: (
 
-            x["confidence"],
-
-            x["probability"],
-
-            x["edge"],
-
-            -x["risk"]
+            x["probability"] * 0.40
+            +
+            x["confidence"] * 0.35
+            +
+            x.get("quality", 0) * 0.15
+            -
+            x["risk"] * 0.10
 
         ),
 
@@ -19343,6 +19506,30 @@ def send_live_signal(
         0
     )
 
+    probability = signal.get(
+        "probability",
+        0
+    )
+
+    confidence = signal.get(
+        "confidence",
+        0
+    )
+
+    risk = signal.get(
+        "risk",
+        100
+    )
+
+    if probability < MIN_LIVE_PROBABILITY:
+        return False
+
+    if confidence < MIN_LIVE_CONFIDENCE:
+        return False
+
+    if risk > MAX_LIVE_RISK:
+        return False
+
     if not live_signal_allowed(
 
         fixture_id,
@@ -19805,6 +19992,28 @@ def get_best_prematch_signals(
                 ] = prematch_signal_score(
                     signal
                 )
+
+
+                # =========================================
+                # ONE SIGNAL PER MATCH                
+                # =========================================
+
+                already_candidate = False
+
+                for existing in candidates:
+
+                    if (
+                        existing.get(
+                            "fixture_id"
+                        )
+                        ==
+                        fixture_id
+                    ):
+                        already_candidate = True
+                        break
+
+                if already_candidate:
+                    continue
 
                 candidates.append(
                     signal
@@ -20539,30 +20748,7 @@ def main_loop():
         )
 
 
-# =========================================================
-# START BOT
-# =========================================================
 
-if __name__ == "__main__":
-
-    try:
-
-        main_loop()
-
-    except KeyboardInterrupt:
-
-        print()
-
-        print(
-            "🛑 BOT STOPPED"
-        )
-
-    except Exception as e:
-
-        logging.exception(
-            "FATAL MAIN ERROR: %s",
-            repr(e)
-        )
 
 # =========================================================
 # LIVE ODDS HISTORY V4
@@ -21890,9 +22076,30 @@ if __name__ == "__main__":
 
     startup()
 
-    main_loop()
+# =========================================================
+# START BOT
+# =========================================================
 
+if __name__ == "__main__":
 
+    try:
+
+        main_loop()
+
+    except KeyboardInterrupt:
+
+        print()
+
+        print(
+            "🛑 BOT STOPPED"
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            "FATAL MAIN ERROR: %s",
+            repr(e)
+        )
 
 
 
