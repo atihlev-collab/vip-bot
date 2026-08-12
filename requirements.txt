@@ -563,6 +563,8 @@ def get_match_odds(fixture_id):
     over25 = None
     under25 = None
 
+    over15 = None                        
+
     over35 = None
     under35 = None
 
@@ -686,20 +688,35 @@ def get_match_odds(fixture_id):
                 if odd is None:
                     continue
 
-                if name.startswith("over 1.5"):       # #16
-                    over15 = odd                      # #20
-                                                               # #16
-                elif name.startswith("over 2.5"):     # #16
-                    over25 = odd                       # #20
-                                                               # #16
-                elif name.startswith("under 2.5"):    # #16
-                    under25 = odd                      # #20
-                                                               # #16
-                elif name.startswith("over 3.5"):     # #16
-                    over35 = odd                       # #20
-                                                               # #16
-                elif name.startswith("under 3.5"):    # #16
-                    under35 = odd                      # #20
+                if name.startswith("over 1.5"):      
+                    over15 = odd                    
+                                                             
+                elif name.startswith("over 2.5"):     
+                    over25 = odd  
+
+                if name.startswith("over 1.5"):     
+                    over15 = odd
+
+                elif name.startswith("over 2.5"):
+                    over25 = odd
+
+                elif name.startswith("under 2.5"):
+                    under25 = odd
+
+                elif name.startswith("over 3.5"):
+                    over35 = odd
+
+                elif name.startswith("under 3.5"):
+                    under35 = odd
+                                                              
+                elif name.startswith("under 2.5"):   
+                    under25 = odd                     
+                                                            
+                elif name.startswith("over 3.5"):    
+                    over35 = odd                       
+                                                              
+                elif name.startswith("under 3.5"):    
+                    under35 = odd                     
 
         # =================================================
         # HOME TEAM GOALS
@@ -1739,6 +1756,15 @@ def build_bet_builder(match):
 
         elif market == "💎 BTTS YES":
             odd = btts_odd
+
+        elif market == "⚽ OVER 1.5":             
+            odd = over15_odd                        
+
+        elif market == "⚽ HOME OVER 1.5":          
+            odd = home15_odd                        
+
+        elif market == "⚽ AWAY OVER 1.5":         
+            odd = away15_odd             
 
         if odd is None:
             continue
@@ -4872,6 +4898,13 @@ def historical_market_score(
         0
     )
 
+    if total < 20:                       
+        return {
+            "score": 50,
+            "known": False,
+            "reason": "Insufficient historical sample"
+        }
+
     winrate = data.get(
         "winrate",
         0
@@ -5198,6 +5231,10 @@ def learning_bonus(
 
     league_data = historical_league_score(
         league
+    )
+
+    odds_data = ODDS_MEMORY.get(           
+        "1.50-1.74"
     )
 
     market_score = market_data.get(
@@ -7345,6 +7382,21 @@ def prematch_market_probabilities(
 
     )
 
+
+    over15 = round(                        
+        (
+            1
+            -
+            poisson.cdf(
+                1,
+                home_attack + away_attack
+            )
+        ) * 100,
+        2
+    )
+
+
+
     # Team goals
 
     home_over15 = round(
@@ -7405,7 +7457,9 @@ def prematch_market_probabilities(
 
         "home_over15": home_over15,
 
-        "away_over15": away_over15
+        "away_over15": away_over15,
+
+        "over15": over15               
 
     }
 
@@ -8155,6 +8209,40 @@ def analyze_prematch(match):
                 candidate
 
             )
+
+
+        # -------------------------------------------------   
+        # OVER 1.5
+        # -------------------------------------------------
+
+        if over15_odd is not None:
+            probability = goal_prob["over15"]
+
+            confidence = prematch_confidence(
+                home_form,
+                away_form,
+                probability
+            )
+
+            risk = prematch_risk(
+                probability,
+                confidence,
+                home_form,
+                away_form
+            )
+
+            candidate = create_prematch_candidate(
+                "⚽ OVER 1.5",
+                probability,
+                over15_odd,
+                confidence
+            )
+
+            if candidate:
+                candidates.append(
+                    candidate
+                )
+
 
         # -------------------------------------------------
         # UNDER 2.5
@@ -12108,6 +12196,38 @@ def analyze_prematch(match):
             away_attack
 
         )
+
+
+        # =================================================       
+        # OVER 1.5                                               
+        # =================================================      
+
+        total_attack = (                                         
+            home_attack                                          
+            +                                                    
+            away_attack                                          
+        )                                                       
+
+        over15_probability = round(                            
+            (                                                     
+                1                                             
+                -                                            
+                (                                            
+                    math.exp(                                 
+                        -total_attack                        
+                    )                                        
+                    *                                          
+                    (                                           
+                        1                                      
+                        +                                     
+                        total_attack                          
+                    )                                           
+                )                                              
+            )                                                 
+            *                                                   
+            100                                                
+        , 1)                                                    
+
 
         # =================================================
         # ODDS
@@ -17816,6 +17936,7 @@ def analyze_live_match(
             home_odd,
             draw_odd,
             away_odd,
+            over15_odd,
             over25_odd,
             under25_odd,
             over35_odd,
@@ -17828,63 +17949,205 @@ def analyze_live_match(
 
         signals = []
 
+
+        # =================================================
+        # LIVE OVER 1.5
+        # =================================================
+
+        current_goals = (
+            home_goals
+            +
+            away_goals
+        )
+
+        if (
+            over15_odd is not None
+            and
+            current_goals < 2
+        ):
+
+            over15_probability = 0
+
+            # Strong live attacking conditions
+            if total_xg >= 1.20:
+                over15_probability += 25
+
+            elif total_xg >= 0.90:
+                over15_probability += 18
+
+            elif total_xg >= 0.65:
+                over15_probability += 10
+
+            # Match pressure
+            if best_pressure >= 75:
+                over15_probability += 20
+
+            elif best_pressure >= 65:
+                over15_probability += 12
+
+            # Attack quality
+            if best_attack >= 75:
+                over15_probability += 15
+
+            elif best_attack >= 65:
+                over15_probability += 8
+
+            # Current match time
+            if minute >= 55:
+                over15_probability += 10
+
+            elif minute >= 40:
+                over15_probability += 5
+
+            # Already one goal is much stronger
+            if current_goals == 1:
+                over15_probability += 15
+
+            # No-goal matches need stronger evidence
+            if current_goals == 0:
+                over15_probability -= 10
+
+            over15_probability = max(
+                0,
+                min(
+                    95,
+                    over15_probability
+                )
+            )
+
+            over15_probability = round(
+                over15_probability,
+                1
+            )
+
+            over15_confidence = round(
+                (
+                    over15_probability
+                    * 0.70
+                )
+                +
+                (
+                    best_attack
+                    * 0.15
+                )
+                +
+                (
+                    best_pressure
+                    * 0.15
+                ),
+                1
+            )
+
+            over15_risk = round(
+                max(
+                    0,
+                    100
+                    -
+                    over15_confidence
+                ),
+                1
+            )
+
+            over15_signal = build_final_live_signal(
+                match,
+                "⚽ OVER 1.5 GOALS",
+                over15_probability,
+                over15_confidence,
+                over15_risk,
+                over15_odd,
+                minute,
+                best_attack,
+                best_pressure,
+                total_xg
+            )
+
+            if over15_signal:
+                signals.append(
+                    over15_signal
+                )
+
+
         # =================================================
         # NEXT GOAL
-        # =================================================
+        # =================================================                                 
 
-        # We use the stronger attacking side.
-        # No unnecessary bonuses.
+        live_next_goal = parse_live_next_goal_odds(
+            fixture_id,
+            home_team.get(
+                "name"
+            ),
+            away_team.get(
+                "name"
+            )
+        )
 
-        if best_team == "HOME":
+        if best_team == "HOME":                         
 
             market = "🎯 NEXT GOAL HOME"
-
-            odd = None
-
-            # API-Football usually exposes
-            # live next-goal markets separately.
-            # If unavailable, do not invent an odd.
 
         else:
 
             market = "🎯 NEXT GOAL AWAY"
 
-            odd = None
 
         # =================================================
-        # TEMPORARY LIVE ODDS
+        # LIVE NEXT GOAL ODDS
         # =================================================
 
-        # Next-goal odds are intentionally left empty here.
-        # The live market parser will be connected separately.
-        #
-        # This prevents the system from using
-        # pre-match 1X2 odds as fake live odds.
+        live_next_goal = parse_live_next_goal_odds(
+            fixture_id,
+            home_team.get(
+                "name"
+            ),
+            away_team.get(
+                "name"
+            )
+        )
+
+        if not live_next_goal:
+            return signals
+
+
+        if market == "🎯 NEXT GOAL HOME":
+
+            odd = live_next_goal.get(
+                "home"
+            )
+
+        else:
+
+            odd = live_next_goal.get(
+                "away"
+            )
+
+            if live_next_goal:
+
+                odd = live_next_goal.get(
+                    "away"
+                )
+
+        # =================================================
+        # LIVE NEXT GOAL SIGNAL
+        # =================================================
 
         if odd is not None:
 
-            signal = build_live_signal(
-
-                market,
-
+            adjusted_probability = adjust_live_probability(
                 probability,
+                odd
+            )
 
+            signal = build_live_signal(
+                market,
+                adjusted_probability,
                 confidence,
-
                 risk,
-
                 odd,
-
                 match,
-
                 minute,
-
                 best_attack,
-
                 best_pressure,
-
                 total_xg
-
             )
 
             if signal:
@@ -17892,6 +18155,7 @@ def analyze_live_match(
                 signals.append(
                     signal
                 )
+
 
         # =================================================
         # LIVE QUALITY CHECK
@@ -18277,6 +18541,145 @@ def parse_live_next_goal_odds(
 
         logging.warning(
             "LIVE ODDS PARSE ERROR: %s",
+            repr(e)
+        )
+
+        return None
+
+
+# =========================================================
+# LIVE CORNERS & CARDS ODDS PARSER
+# =========================================================
+
+def parse_live_corners_cards_odds(
+    fixture_id
+):
+
+    data = get_live_odds(
+        fixture_id
+    )
+
+    if not data:
+        return None
+
+    corners_over15 = None
+    cards_over15 = None
+
+    try:
+
+        for bookmaker in data:
+
+            bets = bookmaker.get(
+                "bets",
+                []
+            )
+
+            for bet in bets:
+
+                bet_name = clean_text(
+                    bet.get("name")
+                )
+
+                # =========================================
+                # CORNERS
+                # =========================================
+
+                if (
+                    "corner" in bet_name
+                    and
+                    (
+                        "total" in bet_name
+                        or
+                        "over/under" in bet_name
+                        or
+                        "over under" in bet_name
+                    )
+                ):
+
+                    for value in bet.get(
+                        "values",
+                        []
+                    ):
+
+                        value_name = clean_text(
+                            value.get("value")
+                        )
+
+                        odd = safe_float(
+                            value.get("odd")
+                        )
+
+                        if odd is None:
+                            continue
+
+                        if (
+                            "over 1.5" in value_name
+                            or
+                            value_name == "over 1.5"
+                        ):
+
+                            corners_over15 = odd
+
+                # =========================================
+                # CARDS
+                # =========================================
+
+                if (
+                    "card" in bet_name
+                    and
+                    (
+                        "total" in bet_name
+                        or
+                        "over/under" in bet_name
+                        or
+                        "over under" in bet_name
+                    )
+                ):
+
+                    for value in bet.get(
+                        "values",
+                        []
+                    ):
+
+                        value_name = clean_text(
+                            value.get("value")
+                        )
+
+                        odd = safe_float(
+                            value.get("odd")
+                        )
+
+                        if odd is None:
+                            continue
+
+                        if (
+                            "over 1.5" in value_name
+                            or
+                            value_name == "over 1.5"
+                        ):
+
+                            cards_over15 = odd
+
+        if (
+            corners_over15 is None
+            and
+            cards_over15 is None
+        ):
+
+            return None
+
+        return {
+            "corners_over15":
+                corners_over15,
+
+            "cards_over15":
+                cards_over15
+        }
+
+    except Exception as e:
+
+        logging.warning(
+            "LIVE CORNERS/CARDS ODDS PARSE ERROR: %s",
             repr(e)
         )
 
