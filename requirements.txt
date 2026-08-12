@@ -17436,6 +17436,20 @@ def build_live_signal(
 
         return None
 
+    # =================================================
+    # ANOMALY SAFETY CHECK                        
+    # =================================================
+
+    if (
+        pressure >= 90
+        and
+        xg < 0.80
+        and
+        attack < 55
+    ):
+        return None
+
+
     if probability < LIVE_MIN_PROBABILITY:
 
         return None
