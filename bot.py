@@ -1,201 +1,15544 @@
+# =========================================================
+# MAIN V4
+# AI BETTING SYSTEM
+# VERSION 4.0
+# =========================================================
 
-
-import requests
 import asyncio
+import logging
+import sqlite3
 import threading
 import time
-from telegram import Bot, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ===== CONFIG =====
-BOT_TOKEN = "8718087603:AAHb4xWFqrmvexVGPJEgc2GmK2Z29GTCfd0"
-API_KEY = "e27351fe232d4274b553a95c2c30f99a"
-CHAT_ID = 6488122776
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-MODE = "AGGRESSIVE"
-BANKROLL = 100
+import requests
 
-bot = Bot(token=BOT_TOKEN)
+from scipy.stats import poisson
+from telegram import Bot
+
+from config import BOT_TOKEN, API_KEY, CHAT_ID
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 BASE_URL = "https://v3.football.api-sports.io"
 
-sent_matches = {}
-last_signals = []
+HEADERS = {
+    "x-apisports-key": API_KEY
+}
 
-# ===== API =====
-def get_live():
+TIMEZONE = ZoneInfo("Europe/Sofia")
+
+REQUEST_TIMEOUT = 20
+API_RETRIES = 3
+
+bot = Bot(token=BOT_TOKEN)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+# =========================================================
+# CACHE
+# =========================================================
+
+CACHE_TIME_FORM = 21600          # 6 hours
+CACHE_TIME_ODDS = 900            # 15 minutes
+CACHE_TIME_STANDINGS = 21600     # 6 hours
+CACHE_TIME_LIVE = 30             # 30 seconds
+
+sent_live = {}
+sent_prematch = {}
+
+team_form_cache = {}
+odds_cache = {}
+standings_cache = {}
+statistics_cache = {}
+betano_market_cache = {}
+live_market_cache = {}
+
+
+# =========================================================
+# LEAGUE FILTERS
+# =========================================================
+
+BLOCKED_WORDS = {
+    "women",
+    "female",
+
+    "reserve",
+    "reserves",
+
+    "academy",
+
+    "u17",
+    "u18",
+    "u19",
+    "u20",
+    "u21",
+    "u22",
+    "u23",
+
+    "friendly",
+    "friendlies",
+
+    "olympic",
+    "amateur"
+}
+
+
+BAD_COUNTRIES = {
+    "Bolivia",
+    "Venezuela",
+
+    "India",
+    "Indonesia",
+
+    "Russia",
+    "Belarus",
+
+    "Israel",
+
+    "Guatemala",
+    "Honduras",
+    "El Salvador",
+
+    "Nicaragua"
+}
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+DB_NAME = "v4_ai.db"
+
+
+def init_database():
+
+    conn = sqlite3.connect(DB_NAME)
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS signals(
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            fixture_id INTEGER,
+
+            country TEXT,
+
+            league TEXT,
+
+            home_team TEXT,
+
+            away_team TEXT,
+
+            market TEXT,
+
+            probability REAL,
+
+            odd REAL,
+
+            confidence REAL,
+
+            result TEXT,
+
+            created_at TEXT
+
+        )
+    """)
+
+    # Faster lookups for fixture / market history
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signals_fixture
+        ON signals(fixture_id)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signals_market
+        ON signals(market)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signals_created
+        ON signals(created_at)
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+def send_telegram(message):
+
     try:
-        return requests.get(BASE_URL+"/fixtures",
-            headers={"x-apisports-key":API_KEY},
-            params={"live":"all"}).json()["response"]
-    except:
-        return []
 
-def get_stats(fid):
-    try:
-        return requests.get(BASE_URL+"/fixtures/statistics",
-            headers={"x-apisports-key":API_KEY},
-            params={"fixture":fid}).json()["response"]
-    except:
-        return []
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
 
-# ===== AI ENGINE =====
-def ai_engine(m, stats):
+            json={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
 
-    minute = m["fixture"]["status"]["elapsed"] or 0
-    home_goals = m["goals"]["home"] or 0
-    away_goals = m["goals"]["away"] or 0
-    total = home_goals + away_goals
+            timeout=20
+        )
 
-    def ex(st,key):
-        for s in st:
-            if s["type"]==key:
+        if response.status_code == 200:
+            return True
+
+        logging.warning(
+            "TELEGRAM ERROR HTTP %s | %s",
+            response.status_code,
+            response.text[:300]
+        )
+
+        return False
+
+    except Exception as e:
+
+        logging.warning(
+            "TELEGRAM ERROR %s",
+            repr(e)
+        )
+
+        return False
+
+
+# =========================================================
+# API ENGINE
+# =========================================================
+
+def api_get(endpoint, params=None):
+
+    params = params or {}
+
+    for attempt in range(1, API_RETRIES + 1):
+
+        try:
+
+            response = requests.get(
+                f"{BASE_URL}/{endpoint}",
+                headers=HEADERS,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            # Successful request
+            if response.status_code == 200:
+
                 try:
-                    return int(str(s["value"]).replace("%",""))
-                except:
-                    return 0
+                    return response.json()
+
+                except ValueError:
+
+                    logging.warning(
+                        "API INVALID JSON | %s",
+                        endpoint
+                    )
+
+                    return {}
+
+            # API limit
+            if response.status_code == 429:
+
+                wait_time = min(10, attempt * 3)
+
+                logging.warning(
+                    "API RATE LIMIT 429 | %s | waiting %ss",
+                    endpoint,
+                    wait_time
+                )
+
+                time.sleep(wait_time)
+                continue
+
+            # Temporary server error
+            if response.status_code >= 500:
+
+                wait_time = attempt
+
+                logging.warning(
+                    "API SERVER ERROR %s | %s | retry %s/%s",
+                    response.status_code,
+                    endpoint,
+                    attempt,
+                    API_RETRIES
+                )
+
+                time.sleep(wait_time)
+                continue
+
+            # Other HTTP error
+            logging.warning(
+                "API HTTP ERROR %s | %s",
+                response.status_code,
+                endpoint
+            )
+
+            time.sleep(1)
+
+        except requests.RequestException as e:
+
+            logging.warning(
+                "API REQUEST ERROR | %s | attempt %s/%s | %s",
+                endpoint,
+                attempt,
+                API_RETRIES,
+                repr(e)
+            )
+
+            time.sleep(attempt)
+
+        except Exception as e:
+
+            logging.warning(
+                "API ERROR | %s | %s",
+                endpoint,
+                repr(e)
+            )
+
+            time.sleep(1)
+
+    return {}
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def blocked_league(name):
+
+    text = clean_text(name)
+
+    for word in BLOCKED_WORDS:
+
+        if word in text:
+            return True
+
+    return False
+
+
+def bad_country(country):
+
+    if not country:
+        return False
+
+    country_clean = str(country).strip().lower()
+
+    return any(
+        country_clean == str(bad).strip().lower()
+        for bad in BAD_COUNTRIES
+    )
+
+
+def safe_float(value, default=None):
+
+    if value is None:
+        return default
+
+    try:
+
+        if isinstance(value, str):
+            value = (
+                value
+                .replace("%", "")
+                .replace(",", ".")
+                .strip()
+            )
+
+            if not value:
+                return default
+
+        return float(value)
+
+    except (ValueError, TypeError):
+
+        return default
+
+
+def clean_text(text):
+
+    if text is None:
+        return ""
+
+    return " ".join(
+        str(text)
+        .lower()
+        .replace("_", " ")
+        .split()
+    )
+
+
+def extract(team, stat_name):
+
+    if not isinstance(team, dict):
         return 0
 
-    # fallback (ако няма stats)
-    if not stats:
-        if minute > 30 and total < 2:
-            return 75, "OVER 1.5"
+    statistics = team.get("statistics", [])
+
+    if not isinstance(statistics, list):
+        return 0
+
+    for stat in statistics:
+
+        if not isinstance(stat, dict):
+            continue
+
+        if stat.get("type") != stat_name:
+            continue
+
+        value = stat.get("value")
+
+        if value is None:
+            return 0
+
+        number = safe_float(value)
+
+        if number is None:
+            return 0
+
+        return number
+
+    return 0
+
+# =========================================================
+# API FUNCTIONS
+# =========================================================
+
+def get_live_matches():
+
+    data = api_get(
+        "fixtures",
+        {
+            "live": "all"
+        }
+    )
+
+    if not isinstance(data, dict):
+        return []
+
+    return data.get("response", [])
+
+
+def get_statistics(fixture_id):
+
+    if not fixture_id:
+        return []
+
+    # LIVE statistics change quickly
+    if fixture_id in statistics_cache:
+
+        cache_time, data = statistics_cache[fixture_id]
+
+        if time.time() - cache_time < CACHE_TIME_LIVE:
+            return data
+
+    data = api_get(
+        "fixtures/statistics",
+        {
+            "fixture": fixture_id
+        }
+    )
+
+    if not isinstance(data, dict):
+        return []
+
+    result = data.get("response", [])
+
+    if not isinstance(result, list):
+        result = []
+
+    statistics_cache[fixture_id] = (
+        time.time(),
+        result
+    )
+
+    return result
+
+
+def get_odds(fixture_id):
+
+    if not fixture_id:
+        return []
+
+    data = api_get(
+        "odds",
+        {
+            "fixture": fixture_id
+        }
+    )
+
+    if not isinstance(data, dict):
+        return []
+
+    result = data.get("response", [])
+
+    if not isinstance(result, list):
+        return []
+
+    return result
+
+
+# =========================================================
+# MATCH ODDS
+# =========================================================
+
+def get_match_odds(fixture_id):
+
+    if not fixture_id:
         return None
 
-    home = stats[0]["statistics"]
-    away = stats[1]["statistics"]
+    # -----------------------------------------------------
+    # CACHE
+    # -----------------------------------------------------
 
-    hs = ex(home,"Shots on Goal")
-    as_ = ex(away,"Shots on Goal")
-    ha = ex(home,"Dangerous Attacks")
-    aa = ex(away,"Dangerous Attacks")
+    if fixture_id in odds_cache:
 
-    tempo = hs + as_
-    pressure = abs(ha - aa)
+        cache_time, data = odds_cache[fixture_id]
 
-    # ===== GAME STATE LOGIC =====
+        if time.time() - cache_time < CACHE_TIME_ODDS:
+            return data
 
-    # 0:0 → търсим гол
-    if total == 0 and minute > 25:
-        if tempo >= 6:
-            return 80, "OVER 1.5"
+    # -----------------------------------------------------
+    # API
+    # -----------------------------------------------------
 
-    # 1 гол → next goal
-    if total == 1:
-        if pressure > 20 and tempo >= 5:
-            return 80, "NEXT GOAL"
+    odds = get_odds(fixture_id)
 
-    # 2+ гола → over
-    if total >= 2:
-        if tempo >= 7:
-            return 82, "OVER 3.5"
+    if not odds:
+        return None
 
-    # силен натиск
-    if (hs >= 5 or as_ >= 5) and pressure > 25:
-        return 82, "NEXT GOAL"
+    # -----------------------------------------------------
+    # FIND BETANO
+    # -----------------------------------------------------
 
-    # слаб мач
-    if tempo <= 2 and minute > 65:
-        return 80, "UNDER 2.5"
+    bookmakers = odds[0].get(
+        "bookmakers",
+        []
+    )
+
+    if not isinstance(bookmakers, list):
+        return None
+
+    betano = None
+
+    for bookmaker in bookmakers:
+
+        bookmaker_id = bookmaker.get("id")
+        bookmaker_name = clean_text(
+            bookmaker.get("name")
+        )
+
+        if (
+            bookmaker_id == 32
+            or bookmaker_name == "betano"
+        ):
+
+            betano = bookmaker
+            break
+
+    if betano is None:
+        return None
+
+    # -----------------------------------------------------
+    # ODDS
+    # -----------------------------------------------------
+
+    home = None
+    draw = None
+    away = None
+
+    over25 = None
+    under25 = None
+
+    over35 = None
+    under35 = None
+
+    btts = None
+
+    home_over15 = None
+    away_over15 = None
+
+    # -----------------------------------------------------
+    # BET MARKETS
+    # -----------------------------------------------------
+
+    bets = betano.get(
+        "bets",
+        []
+    )
+
+    if not isinstance(bets, list):
+        return None
+
+    for bet in bets:
+
+        if not isinstance(bet, dict):
+            continue
+
+        bet_name = clean_text(
+            bet.get("name")
+        )
+
+        values = bet.get(
+            "values",
+            []
+        )
+
+        if not isinstance(values, list):
+            continue
+
+        # =================================================
+        # 1X2
+        # =================================================
+
+        if bet_name in (
+            "match winner",
+            "winner",
+            "1x2"
+        ):
+
+            for value in values:
+
+                if not isinstance(value, dict):
+                    continue
+
+                name = clean_text(
+                    value.get("value")
+                )
+
+                odd = safe_float(
+                    value.get("odd")
+                )
+
+                if odd is None:
+                    continue
+
+                if name == "home":
+                    home = odd
+
+                elif name == "draw":
+                    draw = odd
+
+                elif name == "away":
+                    away = odd
+
+        # =================================================
+        # BTTS
+        # =================================================
+
+        elif (
+            "both teams to score" in bet_name
+            or bet_name == "btts"
+        ):
+
+            for value in values:
+
+                if not isinstance(value, dict):
+                    continue
+
+                name = clean_text(
+                    value.get("value")
+                )
+
+                if name == "yes":
+
+                    btts = safe_float(
+                        value.get("odd")
+                    )
+
+        # =================================================
+        # TOTAL GOALS
+        # =================================================
+
+        elif (
+            "goal" in bet_name
+            and "home" not in bet_name
+            and "away" not in bet_name
+        ):
+
+            for value in values:
+
+                if not isinstance(value, dict):
+                    continue
+
+                name = clean_text(
+                    value.get("value")
+                )
+
+                odd = safe_float(
+                    value.get("odd")
+                )
+
+                if odd is None:
+                    continue
+
+                if name.startswith("over 2.5"):
+                    over25 = odd
+
+                elif name.startswith("under 2.5"):
+                    under25 = odd
+
+                elif name.startswith("over 3.5"):
+                    over35 = odd
+
+                elif name.startswith("under 3.5"):
+                    under35 = odd
+
+        # =================================================
+        # HOME TEAM GOALS
+        # =================================================
+
+        elif (
+            "home" in bet_name
+            and "goal" in bet_name
+        ):
+
+            for value in values:
+
+                if not isinstance(value, dict):
+                    continue
+
+                name = clean_text(
+                    value.get("value")
+                )
+
+                if name.startswith("over 1.5"):
+
+                    home_over15 = safe_float(
+                        value.get("odd")
+                    )
+
+        # =================================================
+        # AWAY TEAM GOALS
+        # =================================================
+
+        elif (
+            "away" in bet_name
+            and "goal" in bet_name
+        ):
+
+            for value in values:
+
+                if not isinstance(value, dict):
+                    continue
+
+                name = clean_text(
+                    value.get("value")
+                )
+
+                if name.startswith("over 1.5"):
+
+                    away_over15 = safe_float(
+                        value.get("odd")
+                    )
+
+    # -----------------------------------------------------
+    # 1X2 IS REQUIRED
+    # -----------------------------------------------------
+
+    if (
+        home is None
+        or draw is None
+        or away is None
+    ):
+        return None
+
+    # -----------------------------------------------------
+    # RESULT
+    # -----------------------------------------------------
+
+    result = (
+        home,
+        draw,
+        away,
+        over25,
+        under25,
+        over35,
+        under35,
+        btts,
+        home_over15,
+        away_over15
+    )
+
+    # -----------------------------------------------------
+    # CACHE
+    # -----------------------------------------------------
+
+    odds_cache[fixture_id] = (
+        time.time(),
+        result
+    )
+
+    return result
+
+# =========================================================
+# TEAM FORM V4
+# =========================================================
+
+def get_team_form(team_id, venue=None):
+
+    if not team_id:
+        return None
+
+    cache_key = f"{team_id}_{venue}"
+
+    # -----------------------------------------------------
+    # CACHE
+    # -----------------------------------------------------
+
+    if cache_key in team_form_cache:
+
+        cache_time, data = team_form_cache[cache_key]
+
+        if time.time() - cache_time < CACHE_TIME_FORM:
+            return data
+
+    # -----------------------------------------------------
+    # API
+    # -----------------------------------------------------
+    # 10 matches are enough for general form.
+    # For home/away analysis we may need more games
+    # to find 5 matches at the requested venue.
+    # -----------------------------------------------------
+
+    last_matches = 10 if venue is None else 20
+
+    data = api_get(
+        "fixtures",
+        {
+            "team": team_id,
+            "last": last_matches
+        }
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    games = data.get("response", [])
+
+    if not isinstance(games, list):
+        return None
+
+    # -----------------------------------------------------
+    # VENUE FILTER
+    # -----------------------------------------------------
+
+    filtered = []
+
+    for game in games:
+
+        try:
+
+            home_id = game["teams"]["home"]["id"]
+
+            if venue == "home":
+
+                if home_id == team_id:
+                    filtered.append(game)
+
+            elif venue == "away":
+
+                if home_id != team_id:
+                    filtered.append(game)
+
+            else:
+
+                filtered.append(game)
+
+        except (KeyError, TypeError):
+            continue
+
+    # -----------------------------------------------------
+    # ONLY THE MOST RECENT 5
+    # -----------------------------------------------------
+
+    games = filtered[:5]
+
+    if len(games) < 5:
+        return None
+
+    played = len(games)
+
+    # -----------------------------------------------------
+    # BASIC STATS
+    # -----------------------------------------------------
+
+    wins = 0
+    draws = 0
+    losses = 0
+
+    scored = 0
+    conceded = 0
+
+    clean_sheets = 0
+    scored_games = 0
+
+    over25 = 0
+    btts = 0
+
+    # -----------------------------------------------------
+    # RECENT FORM
+    # Newest match gets the highest weight.
+    # 5 + 4 + 3 + 2 + 1 = 15
+    # -----------------------------------------------------
+
+    weights = [5, 4, 3, 2, 1]
+
+    recent_points = 0
+    max_recent_points = 3 * sum(weights)
+
+    # -----------------------------------------------------
+    # PROCESS MATCHES
+    # -----------------------------------------------------
+
+    for i, game in enumerate(games):
+
+        try:
+
+            home_id = game["teams"]["home"]["id"]
+
+            gh = safe_float(
+                game["goals"]["home"],
+                0
+            )
+
+            ga = safe_float(
+                game["goals"]["away"],
+                0
+            )
+
+        except (KeyError, TypeError):
+
+            continue
+
+        if home_id == team_id:
+
+            gf = gh
+            gc = ga
+
+        else:
+
+            gf = ga
+            gc = gh
+
+        scored += gf
+        conceded += gc
+
+        # -------------------------------------------------
+        # RESULT
+        # -------------------------------------------------
+
+        if gf > gc:
+
+            wins += 1
+            recent_points += 3 * weights[i]
+
+        elif gf == gc:
+
+            draws += 1
+            recent_points += weights[i]
+
+        else:
+
+            losses += 1
+
+        # -------------------------------------------------
+        # GOAL PROFILE
+        # -------------------------------------------------
+
+        if gf > 0:
+            scored_games += 1
+
+        if gc == 0:
+            clean_sheets += 1
+
+        if gf + gc >= 3:
+            over25 += 1
+
+        if gf > 0 and gc > 0:
+            btts += 1
+
+    # -----------------------------------------------------
+    # FORM
+    # -----------------------------------------------------
+
+    form_points = wins * 3 + draws
+
+    form_pct = round(
+        form_points /
+        (played * 3)
+        * 100,
+        2
+    )
+
+    recent_form_pct = round(
+        recent_points /
+        max_recent_points
+        * 100,
+        2
+    )
+
+    # -----------------------------------------------------
+    # GOALS
+    # -----------------------------------------------------
+
+    avg_scored = round(
+        scored / played,
+        2
+    )
+
+    avg_conceded = round(
+        conceded / played,
+        2
+    )
+
+    goal_diff = scored - conceded
+
+    # -----------------------------------------------------
+    # RESULT
+    # -----------------------------------------------------
+
+    result = {
+
+        "played": played,
+
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+
+        "form_pct": form_pct,
+        "recent_form_pct": recent_form_pct,
+
+        "avg_scored": avg_scored,
+        "avg_conceded": avg_conceded,
+
+        "goal_diff": goal_diff,
+
+        "over25_pct": round(
+            over25 / played * 100,
+            2
+        ),
+
+        "btts_pct": round(
+            btts / played * 100,
+            2
+        ),
+
+        "clean_sheet_pct": round(
+            clean_sheets / played * 100,
+            2
+        ),
+
+        "scored_pct": round(
+            scored_games / played * 100,
+            2
+        )
+    }
+
+    # -----------------------------------------------------
+    # CACHE
+    # -----------------------------------------------------
+
+    team_form_cache[cache_key] = (
+        time.time(),
+        result
+    )
+
+    return result
+
+
+# =========================================================
+# STANDINGS V4
+# =========================================================
+
+def get_league_table(league, season):
+
+    if not league or not season:
+        return {}
+
+    key = f"{league}_{season}"
+
+    # -----------------------------------------------------
+    # CACHE
+    # -----------------------------------------------------
+
+    if key in standings_cache:
+
+        cache_time, data = standings_cache[key]
+
+        if time.time() - cache_time < CACHE_TIME_STANDINGS:
+            return data
+
+    # -----------------------------------------------------
+    # API
+    # -----------------------------------------------------
+
+    data = api_get(
+        "standings",
+        {
+            "league": league,
+            "season": season
+        }
+    )
+
+    if not isinstance(data, dict):
+        return {}
+
+    table = {}
+
+    try:
+
+        response = data.get(
+            "response",
+            []
+        )
+
+        if not response:
+            return {}
+
+        standings = (
+            response[0]
+            .get("league", {})
+            .get("standings", [])
+        )
+
+        if not standings:
+            return {}
+
+        standings = standings[0]
+
+        for row in standings:
+
+            team = row.get("team", {})
+
+            team_id = team.get("id")
+
+            if not team_id:
+                continue
+
+            all_stats = row.get(
+                "all",
+                {}
+            )
+
+            table[team_id] = {
+
+                "rank": row.get(
+                    "rank",
+                    0
+                ),
+
+                "points": row.get(
+                    "points",
+                    0
+                ),
+
+                "played": all_stats.get(
+                    "played",
+                    0
+                ),
+
+                "goal_diff": row.get(
+                    "goalsDiff",
+                    0
+                )
+            }
+
+    except (KeyError, IndexError, TypeError):
+
+        table = {}
+
+    # -----------------------------------------------------
+    # CACHE
+    # -----------------------------------------------------
+
+    standings_cache[key] = (
+        time.time(),
+        table
+    )
+
+    return table
+
+
+# =========================================================
+# POISSON ENGINE V4
+# =========================================================
+
+def poisson_over25(
+    home_attack,
+    away_attack
+):
+
+    home_attack = max(
+        0,
+        safe_float(home_attack, 0)
+    )
+
+    away_attack = max(
+        0,
+        safe_float(away_attack, 0)
+    )
+
+    total_goals = (
+        home_attack +
+        away_attack
+    )
+
+    probability = 1 - poisson.cdf(
+        2,
+        total_goals
+    )
+
+    return round(
+        probability * 100,
+        2
+    )
+
+
+def poisson_over35(
+    home_attack,
+    away_attack
+):
+
+    home_attack = max(
+        0,
+        safe_float(home_attack, 0)
+    )
+
+    away_attack = max(
+        0,
+        safe_float(away_attack, 0)
+    )
+
+    total_goals = (
+        home_attack +
+        away_attack
+    )
+
+    probability = 1 - poisson.cdf(
+        3,
+        total_goals
+    )
+
+    return round(
+        probability * 100,
+        2
+    )
+
+
+def poisson_under25(
+    home_attack,
+    away_attack
+):
+
+    return round(
+        100 -
+        poisson_over25(
+            home_attack,
+            away_attack
+        ),
+        2
+    )
+
+
+def poisson_under35(
+    home_attack,
+    away_attack
+):
+
+    return round(
+        100 -
+        poisson_over35(
+            home_attack,
+            away_attack
+        ),
+        2
+    )
+
+
+def poisson_btts(
+    home_attack,
+    away_attack
+):
+
+    home_attack = max(
+        0,
+        safe_float(home_attack, 0)
+    )
+
+    away_attack = max(
+        0,
+        safe_float(away_attack, 0)
+    )
+
+    home_scores = (
+        1 -
+        poisson.pmf(
+            0,
+            home_attack
+        )
+    )
+
+    away_scores = (
+        1 -
+        poisson.pmf(
+            0,
+            away_attack
+        )
+    )
+
+    probability = (
+        home_scores *
+        away_scores
+    )
+
+    return round(
+        probability * 100,
+        2
+    )
+
+# =========================================================
+# AI TEAM STRENGTH V4
+# =========================================================
+
+def team_strength(form):
+
+    if not form:
+        return 0
+
+    # -----------------------------------------------------
+    # ATTACK
+    # Strong attacking output is important,
+    # but we do not let it dominate the whole model.
+    # -----------------------------------------------------
+
+    attack = (
+        form["avg_scored"] * 30
+        +
+        form["scored_pct"] * 0.20
+    )
+
+    # -----------------------------------------------------
+    # DEFENCE
+    # -----------------------------------------------------
+
+    defence = (
+        form["clean_sheet_pct"] * 0.15
+        -
+        form["avg_conceded"] * 15
+    )
+
+    # -----------------------------------------------------
+    # FORM
+    # Recent form has slightly more weight.
+    # -----------------------------------------------------
+
+    form_score = (
+        form["form_pct"] * 0.25
+        +
+        form["recent_form_pct"] * 0.35
+    )
+
+    # -----------------------------------------------------
+    # GOAL DIFFERENCE
+    # Small adjustment only.
+    # -----------------------------------------------------
+
+    goals = (
+        form["goal_diff"] * 1.5
+    )
+
+    score = (
+        attack
+        +
+        defence
+        +
+        form_score
+        +
+        goals
+    )
+
+    return round(
+        score,
+        2
+    )
+
+
+# =========================================================
+# AI MATCH SCORE V4
+# =========================================================
+
+def ai_match_score(
+    home_form,
+    away_form,
+    table_home=None,
+    table_away=None
+):
+
+    if not home_form or not away_form:
+        return None
+
+    home = team_strength(
+        home_form
+    )
+
+    away = team_strength(
+        away_form
+    )
+
+    # -----------------------------------------------------
+    # LEAGUE TABLE
+    # Small adjustment only.
+    # We do not let the table dominate recent form.
+    # -----------------------------------------------------
+
+    if table_home and table_away:
+
+        home += (
+            table_away["rank"]
+            -
+            table_home["rank"]
+        ) * 1.5
+
+        away += (
+            table_home["rank"]
+            -
+            table_away["rank"]
+        ) * 1.5
+
+        home += (
+            table_home["goal_diff"]
+            -
+            table_away["goal_diff"]
+        ) * 0.20
+
+        away += (
+            table_away["goal_diff"]
+            -
+            table_home["goal_diff"]
+        ) * 0.20
+
+    # -----------------------------------------------------
+    # PREVENT NEGATIVE STRENGTH
+    # -----------------------------------------------------
+
+    home = max(
+        1,
+        home
+    )
+
+    away = max(
+        1,
+        away
+    )
+
+    total_strength = (
+        home +
+        away
+    )
+
+    # -----------------------------------------------------
+    # RELATIVE STRENGTH
+    #
+    # IMPORTANT:
+    # These are NOT final 1X2 probabilities.
+    # They show the relative strength between
+    # the two teams.
+    # -----------------------------------------------------
+
+    home_strength_pct = round(
+        home /
+        total_strength
+        * 100,
+        1
+    )
+
+    away_strength_pct = round(
+        away /
+        total_strength
+        * 100,
+        1
+    )
+
+    return {
+
+        "home_strength": round(
+            home,
+            2
+        ),
+
+        "away_strength": round(
+            away,
+            2
+        ),
+
+        "home_strength_pct": home_strength_pct,
+
+        "away_strength_pct": away_strength_pct
+    }
+
+
+# =========================================================
+# VALUE ENGINE V4
+# =========================================================
+
+def fair_odds(probability):
+
+    probability = safe_float(
+        probability
+    )
+
+    if probability is None:
+        return None
+
+    probability = max(
+        1,
+        min(
+            99,
+            probability
+        )
+    )
+
+    return round(
+        100 /
+        probability,
+        2
+    )
+
+
+def value_edge(
+    probability,
+    bookmaker_odd
+):
+
+    probability = safe_float(
+        probability
+    )
+
+    bookmaker_odd = safe_float(
+        bookmaker_odd
+    )
+
+    if (
+        probability is None
+        or
+        bookmaker_odd is None
+        or
+        bookmaker_odd <= 1.01
+    ):
+        return 0
+
+    fair = fair_odds(
+        probability
+    )
+
+    if fair is None:
+        return 0
+
+    return round(
+        (
+            bookmaker_odd -
+            fair
+        )
+        /
+        fair
+        * 100,
+        1
+    )
+
+
+# =========================================================
+# VALUE CLASSIFIER V4
+# =========================================================
+
+def classify_value(
+    probability,
+    odd
+):
+
+    edge = value_edge(
+        probability,
+        odd
+    )
+
+    # Only two useful levels.
+    # We deliberately avoid too many classifications.
+
+    if edge >= 15:
+
+        return (
+            "💎 SUPER VALUE",
+            edge
+        )
+
+    if edge >= 8:
+
+        return (
+            "⭐ VALUE",
+            edge
+        )
+
+    return (
+        None,
+        edge
+    )
+
+
+# =========================================================
+# MARKET FILTER V4
+# =========================================================
+
+def market_allowed(
+    probability,
+    odd,
+    minimum_probability,
+    minimum_odd=1.50,
+    maximum_odd=4.00
+):
+
+    probability = safe_float(
+        probability
+    )
+
+    odd = safe_float(
+        odd
+    )
+
+    if probability is None:
+        return False
+
+    if odd is None:
+        return False
+
+    if probability < minimum_probability:
+        return False
+
+    if odd < minimum_odd:
+        return False
+
+    if odd > maximum_odd:
+        return False
+
+    return True
+
+# =========================================================
+# BET BUILDER AI V4
+# =========================================================
+
+BET_BUILDER_MIN_ODD = 1.50
+BET_BUILDER_MAX_ODD = 3.50
+
+
+def build_bet_builder(match):
+
+    """
+    V4 does NOT build large combinations.
+
+    The main system sends individual high-quality signals.
+    This builder is kept only as an optional helper for
+    a very small combination when there is enough quality.
+    """
+
+    if not match:
+        return None
+
+    fixture = match.get(
+        "fixture",
+        {}
+    ).get("id")
+
+    if not fixture:
+        return None
+
+    signals = analyze_prematch(match)
+
+    if not signals:
+        return None
+
+    odds = get_match_odds(
+        fixture
+    )
+
+    if not odds:
+        return None
+
+    (
+        home_odd,
+        draw_odd,
+        away_odd,
+        over25_odd,
+        under25_odd,
+        over35_odd,
+        under35_odd,
+        btts_odd,
+        home15_odd,
+        away15_odd
+    ) = odds
+
+    # -----------------------------------------------------
+    # V4 PRINCIPLE:
+    # maximum 2 selections.
+    # We do not create long accumulators.
+    # -----------------------------------------------------
+
+    candidates = []
+
+    for signal in signals:
+
+        market = signal.get(
+            "market"
+        )
+
+        probability = safe_float(
+            signal.get("probability")
+        )
+
+        confidence = safe_float(
+            signal.get("confidence")
+        )
+
+        if (
+            probability is None
+            or
+            confidence is None
+        ):
+            continue
+
+        odd = None
+
+        if market == "🏆 HOME WIN":
+            odd = home_odd
+
+        elif market == "✈️ AWAY WIN":
+            odd = away_odd
+
+        elif market == "🚀 OVER 2.5":
+            odd = over25_odd
+
+        elif market == "🛡 UNDER 2.5":
+            odd = under25_odd
+
+        elif market == "💎 BTTS YES":
+            odd = btts_odd
+
+        if odd is None:
+            continue
+
+        if (
+            odd < BET_BUILDER_MIN_ODD
+            or
+            odd > BET_BUILDER_MAX_ODD
+        ):
+            continue
+
+        candidates.append({
+            "market": market,
+            "odd": odd,
+            "probability": probability,
+            "confidence": confidence
+        })
+
+    if not candidates:
+        return None
+
+    # Strongest signals first
+    candidates.sort(
+        key=lambda x: (
+            x["confidence"],
+            x["probability"]
+        ),
+        reverse=True
+    )
+
+    # -----------------------------------------------------
+    # ONE STRONG SIGNAL
+    # -----------------------------------------------------
+
+    best = candidates[0]
+
+    selections = [
+        (
+            best["market"],
+            best["odd"]
+        )
+    ]
+
+    total_odd = best["odd"]
+
+    # -----------------------------------------------------
+    # OPTIONAL SECOND SIGNAL
+    # -----------------------------------------------------
+
+    if len(candidates) > 1:
+
+        second = candidates[1]
+
+        # Do not combine identical / conflicting markets.
+        if second["market"] != best["market"]:
+
+            combined_odd = (
+                total_odd *
+                second["odd"]
+            )
+
+            if (
+                combined_odd >= BET_BUILDER_MIN_ODD
+                and
+                combined_odd <= BET_BUILDER_MAX_ODD
+            ):
+
+                selections.append(
+                    (
+                        second["market"],
+                        second["odd"]
+                    )
+                )
+
+                total_odd = combined_odd
+
+    total_odd = round(
+        total_odd,
+        2
+    )
+
+    return {
+
+        "fixture_id": fixture,
+
+        "total_odd": total_odd,
+
+        "legs": selections
+    }
+
+
+# =========================================================
+# LIVE CONFIDENCE ENGINE V4
+# =========================================================
+
+def calculate_confidence(
+    pressure,
+    attack,
+    xg,
+    shots_on,
+    total_shots,
+    corners,
+    minute,
+    goal_diff
+):
+
+    """
+    Simple confidence model.
+
+    Only the strongest live indicators are used.
+    """
+
+    confidence = 50.0
+
+    pressure = safe_float(
+        pressure,
+        0
+    )
+
+    attack = safe_float(
+        attack,
+        0
+    )
+
+    xg = safe_float(
+        xg,
+        0
+    )
+
+    shots_on = safe_float(
+        shots_on,
+        0
+    )
+
+    total_shots = safe_float(
+        total_shots,
+        0
+    )
+
+    corners = safe_float(
+        corners,
+        0
+    )
+
+    minute = safe_float(
+        minute,
+        0
+    )
+
+    goal_diff = abs(
+        safe_float(
+            goal_diff,
+            0
+        )
+    )
+
+    # -----------------------------------------------------
+    # PRESSURE
+    # -----------------------------------------------------
+
+    confidence += (
+        max(0, pressure - 60)
+        * 0.30
+    )
+
+    # -----------------------------------------------------
+    # ATTACK MOMENTUM
+    # -----------------------------------------------------
+
+    confidence += (
+        max(0, attack - 60)
+        * 0.25
+    )
+
+    # -----------------------------------------------------
+    # xG
+    # -----------------------------------------------------
+
+    confidence += min(
+        10,
+        xg * 5
+    )
+
+    # -----------------------------------------------------
+    # SHOTS ON TARGET
+    # -----------------------------------------------------
+
+    confidence += min(
+        8,
+        shots_on * 1.2
+    )
+
+    # -----------------------------------------------------
+    # TOTAL SHOTS
+    # -----------------------------------------------------
+
+    confidence += min(
+        5,
+        total_shots * 0.25
+    )
+
+    # -----------------------------------------------------
+    # CORNERS
+    # Secondary factor only.
+    # -----------------------------------------------------
+
+    confidence += min(
+        4,
+        corners * 0.4
+    )
+
+    # -----------------------------------------------------
+    # LIVE WINDOW
+    # Small bonus only.
+    # -----------------------------------------------------
+
+    if 55 <= minute <= 80:
+        confidence += 3
+
+    # -----------------------------------------------------
+    # CLOSE GAME
+    # -----------------------------------------------------
+
+    if goal_diff <= 1:
+        confidence += 3
+
+    return round(
+        min(
+            95,
+            confidence
+        ),
+        1
+    )
+
+
+# =========================================================
+# SMART VALUE ENGINE V4
+# =========================================================
+
+def smart_value_score(
+    probability,
+    odd,
+    confidence
+):
+
+    """
+    Simple value score.
+
+    V4 intentionally avoids stacking many correlated
+    variables into another artificial score.
+    """
+
+    probability = safe_float(
+        probability
+    )
+
+    odd = safe_float(
+        odd
+    )
+
+    confidence = safe_float(
+        confidence
+    )
+
+    if (
+        probability is None
+        or
+        odd is None
+        or
+        confidence is None
+        or
+        odd <= 1.01
+    ):
+        return 0
+
+    implied_probability = (
+        100 /
+        odd
+    )
+
+    edge = (
+        probability -
+        implied_probability
+    )
+
+    score = (
+        probability * 0.50
+        +
+        edge * 1.50
+        +
+        confidence * 0.25
+    )
+
+    return round(
+        max(
+            0,
+            min(
+                100,
+                score
+            )
+        ),
+        2
+    )
+
+
+# =========================================================
+# AI RISK FILTER V4
+# =========================================================
+
+def risk_filter(
+    probability,
+    confidence,
+    edge
+):
+
+    """
+    Small risk filter.
+
+    Only three major factors are used.
+    """
+
+    probability = safe_float(
+        probability,
+        0
+    )
+
+    confidence = safe_float(
+        confidence,
+        0
+    )
+
+    edge = safe_float(
+        edge,
+        0
+    )
+
+    risk = 0
+
+    # -----------------------------------------------------
+    # PROBABILITY
+    # -----------------------------------------------------
+
+    if probability < 60:
+        risk += 30
+
+    elif probability < 70:
+        risk += 15
+
+    # -----------------------------------------------------
+    # CONFIDENCE
+    # -----------------------------------------------------
+
+    if confidence < 75:
+        risk += 25
+
+    elif confidence < 82:
+        risk += 10
+
+    # -----------------------------------------------------
+    # VALUE
+    # -----------------------------------------------------
+
+    if edge < 3:
+        risk += 20
+
+    elif edge < 6:
+        risk += 10
+
+    return min(
+        risk,
+        100
+    )
+
+
+# =========================================================
+# SIMPLE ODDS SCORE V4
+# =========================================================
+
+def smart_odds_score(
+    probability,
+    odd,
+    confidence
+):
+
+    probability = safe_float(
+        probability
+    )
+
+    odd = safe_float(
+        odd
+    )
+
+    confidence = safe_float(
+        confidence
+    )
+
+    if (
+        probability is None
+        or
+        odd is None
+        or
+        confidence is None
+        or
+        odd <= 1.01
+    ):
+        return 0
+
+    implied_probability = (
+        100 /
+        odd
+    )
+
+    edge = (
+        probability -
+        implied_probability
+    )
+
+    score = 50
+
+    # Value
+    score += edge * 1.5
+
+    # Confidence
+    score += (
+        confidence -
+        70
+    ) * 0.40
+
+    return round(
+        max(
+            0,
+            min(
+                100,
+                score
+            )
+        ),
+        1
+    )
+
+# =========================================================
+# AI MATCH QUALITY ENGINE V4
+# =========================================================
+
+def match_quality_score(
+    home_form,
+    away_form,
+    home_pressure,
+    away_pressure,
+    home_xg,
+    away_xg,
+    total_shots,
+    total_shots_on,
+    minute
+):
+
+    if not home_form or not away_form:
+        return 0
+
+    home_pressure = safe_float(
+        home_pressure,
+        0
+    )
+
+    away_pressure = safe_float(
+        away_pressure,
+        0
+    )
+
+    home_xg = safe_float(
+        home_xg,
+        0
+    )
+
+    away_xg = safe_float(
+        away_xg,
+        0
+    )
+
+    total_shots = safe_float(
+        total_shots,
+        0
+    )
+
+    total_shots_on = safe_float(
+        total_shots_on,
+        0
+    )
+
+    minute = safe_float(
+        minute,
+        0
+    )
+
+    # -----------------------------------------------------
+    # START
+    # -----------------------------------------------------
+
+    quality = 40.0
+
+    # -----------------------------------------------------
+    # RECENT FORM
+    # Small contribution.
+    # Form should not dominate LIVE analysis.
+    # -----------------------------------------------------
+
+    quality += (
+        (
+            home_form.get(
+                "recent_form_pct",
+                0
+            )
+            +
+            away_form.get(
+                "recent_form_pct",
+                0
+            )
+        )
+        * 0.05
+    )
+
+    # -----------------------------------------------------
+    # PRESSURE
+    # Strongest live indicator.
+    # -----------------------------------------------------
+
+    best_pressure = max(
+        home_pressure,
+        away_pressure
+    )
+
+    quality += (
+        max(
+            0,
+            best_pressure - 60
+        )
+        * 0.20
+    )
+
+    # -----------------------------------------------------
+    # xG
+    # -----------------------------------------------------
+
+    quality += (
+        home_xg +
+        away_xg
+    ) * 7
+
+    # -----------------------------------------------------
+    # SHOTS
+    # Secondary confirmation.
+    # -----------------------------------------------------
+
+    quality += min(
+        10,
+        total_shots * 0.35
+    )
+
+    quality += min(
+        8,
+        total_shots_on * 1.2
+    )
+
+    # -----------------------------------------------------
+    # LIVE WINDOW
+    # Very small bonus.
+    # -----------------------------------------------------
+
+    if 55 <= minute <= 80:
+        quality += 3
+
+    return round(
+        min(
+            100,
+            quality
+        ),
+        1
+    )
+
+
+# =========================================================
+# AI RISK ENGINE V4
+# =========================================================
+
+def calculate_risk(
+    probability,
+    confidence,
+    edge
+):
+
+    probability = safe_float(
+        probability,
+        0
+    )
+
+    confidence = safe_float(
+        confidence,
+        0
+    )
+
+    edge = safe_float(
+        edge,
+        0
+    )
+
+    risk = 0
+
+    # -----------------------------------------------------
+    # PROBABILITY
+    # -----------------------------------------------------
+
+    if probability < 60:
+        risk += 30
+
+    elif probability < 70:
+        risk += 15
+
+    # -----------------------------------------------------
+    # CONFIDENCE
+    # -----------------------------------------------------
+
+    if confidence < 75:
+        risk += 25
+
+    elif confidence < 82:
+        risk += 10
+
+    # -----------------------------------------------------
+    # VALUE
+    # -----------------------------------------------------
+
+    if edge < 3:
+        risk += 20
+
+    elif edge < 6:
+        risk += 10
+
+    return min(
+        100,
+        risk
+    )
+
+
+# =========================================================
+# DYNAMIC LIVE THRESHOLD V4
+# =========================================================
+
+def dynamic_threshold(
+    minute,
+    pressure,
+    attack,
+    match_quality,
+    risk
+):
+
+    pressure = safe_float(
+        pressure,
+        0
+    )
+
+    attack = safe_float(
+        attack,
+        0
+    )
+
+    match_quality = safe_float(
+        match_quality,
+        0
+    )
+
+    risk = safe_float(
+        risk,
+        0
+    )
+
+    # -----------------------------------------------------
+    # BASE
+    # -----------------------------------------------------
+
+    threshold = 82
+
+    # -----------------------------------------------------
+    # MATCH QUALITY
+    # Only small adjustments.
+    # -----------------------------------------------------
+
+    if match_quality >= 90:
+
+        threshold -= 4
+
+    elif match_quality >= 82:
+
+        threshold -= 2
+
+    # -----------------------------------------------------
+    # ATTACK
+    # -----------------------------------------------------
+
+    if attack >= 90:
+
+        threshold -= 2
+
+    # -----------------------------------------------------
+    # PRESSURE
+    # -----------------------------------------------------
+
+    if pressure >= 90:
+
+        threshold -= 2
+
+    # -----------------------------------------------------
+    # RISK
+    # Risk has stronger influence than bonuses.
+    # -----------------------------------------------------
+
+    if risk >= 60:
+
+        threshold += 5
+
+    elif risk >= 45:
+
+        threshold += 2
+
+    # -----------------------------------------------------
+    # LATE GAME
+    # -----------------------------------------------------
+
+    if minute >= 80:
+
+        threshold -= 2
+
+    # -----------------------------------------------------
+    # SAFETY LIMITS
+    # -----------------------------------------------------
+
+    return max(
+        75,
+        min(
+            90,
+            threshold
+        )
+    )
+
+# =========================================================
+# AI SIGNAL MANAGER V4
+# =========================================================
+
+class SignalManager:
+
+    def __init__(self):
+
+        self.signals = []
+
+    def add(
+        self,
+        market,
+        probability,
+        confidence,
+        quality,
+        risk,
+        minute
+    ):
+
+        probability = safe_float(
+            probability,
+            0
+        )
+
+        confidence = safe_float(
+            confidence,
+            0
+        )
+
+        quality = safe_float(
+            quality,
+            0
+        )
+
+        risk = safe_float(
+            risk,
+            100
+        )
+
+        # -------------------------------------------------
+        # V4 SIGNAL SCORE
+        #
+        # Only used for choosing between already
+        # qualified signals.
+        #
+        # It does NOT create a signal by itself.
+        # -------------------------------------------------
+
+        score = (
+            probability * 0.40
+            +
+            confidence * 0.35
+            +
+            quality * 0.15
+            -
+            risk * 0.10
+        )
+
+        self.signals.append({
+
+            "market": market,
+
+            "probability": probability,
+
+            "confidence": confidence,
+
+            "quality": quality,
+
+            "risk": risk,
+
+            "minute": minute,
+
+            "score": round(
+                score,
+                2
+            )
+        })
+
+    def best(self):
+
+        if not self.signals:
+            return None
+
+        return max(
+            self.signals,
+            key=lambda x: x["score"]
+        )
+
+
+# =========================================================
+# AI CONTEXT ENGINE V4
+# =========================================================
+
+def context_score(
+    minute,
+    home_goals,
+    away_goals,
+    red_home,
+    red_away,
+    favorite,
+    attack_diff
+):
+
+    score = 50
+
+    minute = safe_float(
+        minute,
+        0
+    )
+
+    home_goals = safe_float(
+        home_goals,
+        0
+    )
+
+    away_goals = safe_float(
+        away_goals,
+        0
+    )
+
+    red_home = safe_float(
+        red_home,
+        0
+    )
+
+    red_away = safe_float(
+        red_away,
+        0
+    )
+
+    attack_diff = safe_float(
+        attack_diff,
+        0
+    )
+
+    # -----------------------------------------------------
+    # MATCH MINUTE
+    # Small bonus only.
+    # -----------------------------------------------------
+
+    if 60 <= minute <= 80:
+
+        score += 4
+
+    elif minute > 80:
+
+        score += 2
+
+    # -----------------------------------------------------
+    # CLOSE GAME
+    # -----------------------------------------------------
+
+    if abs(
+        home_goals -
+        away_goals
+    ) <= 1:
+
+        score += 5
+
+    # -----------------------------------------------------
+    # RED CARDS
+    # -----------------------------------------------------
+
+    if red_home > red_away:
+
+        score -= 8
+
+    elif red_away > red_home:
+
+        score -= 8
+
+    # -----------------------------------------------------
+    # FAVOURITE BEHIND
+    # -----------------------------------------------------
+
+    if favorite == "HOME":
+
+        if home_goals < away_goals:
+            score += 6
+
+    elif favorite == "AWAY":
+
+        if away_goals < home_goals:
+            score += 6
+
+    # -----------------------------------------------------
+    # ATTACK DIFFERENCE
+    # -----------------------------------------------------
+
+    if abs(attack_diff) >= 25:
+
+        score += 6
+
+    elif abs(attack_diff) >= 15:
+
+        score += 3
+
+    return round(
+        max(
+            0,
+            min(
+                100,
+                score
+            )
+        ),
+        1
+    )
+
+
+# =========================================================
+# AI EXPLAINABILITY ENGINE V4
+# =========================================================
+
+def explain_signal(
+    market,
+    probability,
+    confidence,
+    attack,
+    pressure,
+    quality,
+    risk
+):
+
+    reasons = []
+
+    probability = safe_float(
+        probability,
+        0
+    )
+
+    confidence = safe_float(
+        confidence,
+        0
+    )
+
+    attack = safe_float(
+        attack,
+        0
+    )
+
+    pressure = safe_float(
+        pressure,
+        0
+    )
+
+    quality = safe_float(
+        quality,
+        0
+    )
+
+    risk = safe_float(
+        risk,
+        100
+    )
+
+    # -----------------------------------------------------
+    # STRONGEST REASONS ONLY
+    # -----------------------------------------------------
+
+    if probability >= 80:
+
+        reasons.append(
+            f"High probability {probability:.1f}%"
+        )
+
+    elif probability >= 75:
+
+        reasons.append(
+            f"Good probability {probability:.1f}%"
+        )
+
+    if confidence >= 85:
+
+        reasons.append(
+            f"Strong confidence {confidence:.1f}"
+        )
+
+    if attack >= 80:
+
+        reasons.append(
+            f"Strong attack {attack:.1f}"
+        )
+
+    if pressure >= 75:
+
+        reasons.append(
+            f"High pressure {pressure:.1f}"
+        )
+
+    if quality >= 80:
+
+        reasons.append(
+            f"High match quality {quality:.1f}"
+        )
+
+    if risk <= 20:
+
+        reasons.append(
+            "Low calculated risk"
+        )
+
+    if not reasons:
+
+        reasons.append(
+            "Multiple supporting indicators"
+        )
+
+    return {
+
+        "market": market,
+
+        "summary": " | ".join(
+            reasons[:4]
+        )
+    }
+
+
+# =========================================================
+# AI PERFORMANCE TRACKER V4
+# =========================================================
+
+def performance_report(conn):
+
+    if conn is None:
+        return []
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            market,
+            COUNT(*),
+            SUM(
+                CASE
+                    WHEN result = 'WIN'
+                    THEN 1
+                    ELSE 0
+                END
+            )
+        FROM signals
+        WHERE result IS NOT NULL
+        GROUP BY market
+    """)
+
+    rows = cursor.fetchall()
+
+    report = []
+
+    for market, total, wins in rows:
+
+        if not total:
+            continue
+
+        winrate = round(
+            wins * 100 / total,
+            1
+        )
+
+        # -------------------------------------------------
+        # STATUS
+        # -------------------------------------------------
+
+        if total < 20:
+
+            status = "📊 SMALL SAMPLE"
+
+        elif winrate >= 85:
+
+            status = "👑 ELITE"
+
+        elif winrate >= 80:
+
+            status = "🔥 EXCELLENT"
+
+        elif winrate >= 75:
+
+            status = "💎 GOOD"
+
+        elif winrate >= 70:
+
+            status = "⭐ OK"
+
+        else:
+
+            status = "⚠ NEEDS IMPROVEMENT"
+
+        report.append({
+
+            "market": market,
+
+            "total": total,
+
+            "wins": wins,
+
+            "winrate": winrate,
+
+            "status": status
+        })
+
+    return sorted(
+        report,
+        key=lambda x: (
+            x["winrate"],
+            x["total"]
+        ),
+        reverse=True
+    )
+
+# =========================================================
+# AI SIGNAL COOLDOWN ENGINE V4
+# =========================================================
+
+SIGNAL_HISTORY = {}
+
+
+def can_send_signal(
+    fixture_id,
+    market,
+    cooldown=600
+):
+
+    if not fixture_id or not market:
+        return False
+
+    key = f"{fixture_id}_{market}"
+
+    now = time.time()
+
+    # -----------------------------------------------------
+    # First signal
+    # -----------------------------------------------------
+
+    if key not in SIGNAL_HISTORY:
+
+        SIGNAL_HISTORY[key] = now
+
+        return True
+
+    # -----------------------------------------------------
+    # Existing signal
+    # -----------------------------------------------------
+
+    elapsed = (
+        now -
+        SIGNAL_HISTORY[key]
+    )
+
+    if elapsed >= cooldown:
+
+        SIGNAL_HISTORY[key] = now
+
+        return True
+
+    return False
+
+
+# =========================================================
+# SIGNIFICANT LIVE CHANGE
+# =========================================================
+
+def significant_change(
+    previous_attack,
+    current_attack,
+    previous_pressure,
+    current_pressure
+):
+
+    previous_attack = safe_float(
+        previous_attack,
+        0
+    )
+
+    current_attack = safe_float(
+        current_attack,
+        0
+    )
+
+    previous_pressure = safe_float(
+        previous_pressure,
+        0
+    )
+
+    current_pressure = safe_float(
+        current_pressure,
+        0
+    )
+
+    # -----------------------------------------------------
+    # ATTACK CHANGE
+    # -----------------------------------------------------
+
+    if abs(
+        current_attack -
+        previous_attack
+    ) >= 12:
+
+        return True
+
+    # -----------------------------------------------------
+    # PRESSURE CHANGE
+    # -----------------------------------------------------
+
+    if abs(
+        current_pressure -
+        previous_pressure
+    ) >= 15:
+
+        return True
+
+    return False
+
+
+# =========================================================
+# LIVE SIGNAL STATE
+# =========================================================
+
+LIVE_STATE = {}
+
+
+def get_live_state(fixture_id):
+
+    if fixture_id not in LIVE_STATE:
+
+        LIVE_STATE[fixture_id] = {
+
+            "attack": 0,
+
+            "pressure": 0,
+
+            "minute": 0,
+
+            "last_score": None,
+
+            "updated_at": 0
+        }
+
+    return LIVE_STATE[fixture_id]
+
+
+def update_live_state(
+    fixture_id,
+    attack,
+    pressure,
+    minute,
+    current_score
+):
+
+    state = get_live_state(
+        fixture_id
+    )
+
+    previous_attack = state.get(
+        "attack",
+        0
+    )
+
+    previous_pressure = state.get(
+        "pressure",
+        0
+    )
+
+    previous_score = state.get(
+        "last_score"
+    )
+
+    changed = significant_change(
+        previous_attack,
+        attack,
+        previous_pressure,
+        pressure
+    )
+
+    score_changed = (
+        previous_score is not None
+        and
+        previous_score != current_score
+    )
+
+    # -----------------------------------------------------
+    # UPDATE STATE
+    # -----------------------------------------------------
+
+    state["attack"] = safe_float(
+        attack,
+        0
+    )
+
+    state["pressure"] = safe_float(
+        pressure,
+        0
+    )
+
+    state["minute"] = safe_float(
+        minute,
+        0
+    )
+
+    state["last_score"] = current_score
+
+    state["updated_at"] = time.time()
+
+    return {
+        "significant_change": changed,
+        "score_changed": score_changed,
+        "previous_score": previous_score
+    }
+
+# =========================================================
+# AI ANOMALY DETECTION ENGINE V4
+# =========================================================
+
+def anomaly_score(
+    pressure,
+    attack,
+    xg,
+    shots_on,
+    possession
+):
+
+    pressure = safe_float(
+        pressure,
+        0
+    )
+
+    attack = safe_float(
+        attack,
+        0
+    )
+
+    xg = safe_float(
+        xg,
+        0
+    )
+
+    shots_on = safe_float(
+        shots_on,
+        0
+    )
+
+    possession = safe_float(
+        possession,
+        0
+    )
+
+    anomalies = []
+
+    # -----------------------------------------------------
+    # HIGH PRESSURE / LOW SHOTS
+    # -----------------------------------------------------
+
+    if (
+        pressure >= 85
+        and
+        shots_on <= 1
+    ):
+
+        anomalies.append(
+            "High pressure / low shots"
+        )
+
+    # -----------------------------------------------------
+    # HIGH xG / LOW ATTACK
+    # -----------------------------------------------------
+
+    if (
+        xg >= 2.0
+        and
+        attack < 60
+    ):
+
+        anomalies.append(
+            "High xG / weak attack"
+        )
+
+    # -----------------------------------------------------
+    # POSSESSION / PRESSURE MISMATCH
+    # -----------------------------------------------------
+
+    if (
+        possession >= 70
+        and
+        pressure < 45
+    ):
+
+        anomalies.append(
+            "Possession / pressure mismatch"
+        )
+
+    # -----------------------------------------------------
+    # SCORE
+    # -----------------------------------------------------
+
+    score = max(
+        0,
+        100 -
+        len(anomalies) * 20
+    )
+
+    return (
+        score,
+        anomalies
+    )
+
+# =========================================================
+# AI DATA RELIABILITY ENGINE V4
+# =========================================================
+
+def reliability_score(
+    pressure,
+    attack,
+    xg,
+    shots_on,
+    total_shots,
+    possession,
+    minute
+):
+
+    score = 100
+
+    # -----------------------------------------------------
+    # MISSING DATA
+    # -----------------------------------------------------
+
+    if pressure is None:
+        score -= 15
+
+    if attack is None:
+        score -= 15
+
+    if xg is None:
+        score -= 10
+
+    if shots_on is None:
+        score -= 10
+
+    if total_shots is None:
+        score -= 10
+
+    if possession is None:
+        score -= 5
+
+    # -----------------------------------------------------
+    # EARLY MATCH
+    # -----------------------------------------------------
+
+    if minute is None:
+        score -= 15
+
+    elif minute < 10:
+        score -= 20
+
+    # -----------------------------------------------------
+    # IMPOSSIBLE VALUES
+    # -----------------------------------------------------
+
+    if pressure is not None:
+
+        if pressure < 0 or pressure > 100:
+            score -= 30
+
+    if possession is not None:
+
+        if possession < 0 or possession > 100:
+            score -= 30
+
+    # -----------------------------------------------------
+    # NUMERIC VALIDATION
+    # -----------------------------------------------------
+
+    for value in (
+        attack,
+        xg,
+        shots_on,
+        total_shots
+    ):
+
+        if value is not None:
+
+            try:
+
+                if float(value) < 0:
+                    score -= 15
+
+            except (ValueError, TypeError):
+
+                score -= 15
+
+    return max(
+        0,
+        min(
+            100,
+            score
+        )
+    )
+
+
+# =========================================================
+# DATA RELIABILITY CHECK
+# =========================================================
+
+def reliable_live_data(
+    pressure,
+    attack,
+    xg,
+    shots_on,
+    total_shots,
+    possession,
+    minute
+):
+
+    reliability = reliability_score(
+        pressure,
+        attack,
+        xg,
+        shots_on,
+        total_shots,
+        possession,
+        minute
+    )
+
+    # -----------------------------------------------------
+    # We do NOT modify confidence here.
+    #
+    # Reliability is a data-quality check,
+    # not another confidence bonus/penalty system.
+    # -----------------------------------------------------
+
+    return reliability
+
+# =========================================================
+# AI MATCH REGIME ENGINE V4
+# =========================================================
+
+def detect_match_regime(
+    pressure,
+    attack,
+    xg,
+    shots_on,
+    possession,
+    minute
+):
+
+    pressure = safe_float(
+        pressure,
+        0
+    )
+
+    attack = safe_float(
+        attack,
+        0
+    )
+
+    xg = safe_float(
+        xg,
+        0
+    )
+
+    shots_on = safe_float(
+        shots_on,
+        0
+    )
+
+    possession = safe_float(
+        possession,
+        0
+    )
+
+    minute = safe_float(
+        minute,
+        0
+    )
+
+    # -----------------------------------------------------
+    # CHAOTIC
+    # Highest priority.
+    # -----------------------------------------------------
+
+    if (
+        minute >= 75
+        and
+        pressure >= 85
+        and
+        attack >= 80
+    ):
+
+        return "CHAOTIC"
+
+    # -----------------------------------------------------
+    # OPEN
+    # -----------------------------------------------------
+
+    if (
+        attack >= 80
+        and
+        pressure >= 75
+        and
+        xg >= 2.0
+    ):
+
+        return "OPEN"
+
+    # -----------------------------------------------------
+    # DEFENSIVE
+    # -----------------------------------------------------
+
+    if (
+        xg < 1.2
+        and
+        shots_on <= 3
+        and
+        pressure < 60
+    ):
+
+        return "DEFENSIVE"
+
+    # -----------------------------------------------------
+    # CONTROLLED
+    # -----------------------------------------------------
+
+    if (
+        possession >= 60
+        and
+        pressure >= 60
+    ):
+
+        return "CONTROLLED"
+
+    return "NORMAL"
+
+# =========================================================
+# AI EXPECTED VALUE ENGINE V4
+# =========================================================
+
+def expected_value(
+    probability,
+    odd
+):
+
+    probability = safe_float(
+        probability
+    )
+
+    odd = safe_float(
+        odd
+    )
+
+    if (
+        probability is None
+        or
+        odd is None
+        or
+        odd <= 1.01
+    ):
+        return None
+
+    probability_decimal = (
+        probability / 100
+    )
+
+    ev = (
+        probability_decimal *
+        odd
+    ) - 1
+
+    return round(
+        ev,
+        3
+    )
+
+
+# =========================================================
+# EXPECTED VALUE CHECK
+# =========================================================
+
+def has_positive_value(
+    probability,
+    odd,
+    minimum_ev=0.03
+):
+
+    ev = expected_value(
+        probability,
+        odd
+    )
+
+    if ev is None:
+        return False
+
+    return ev >= minimum_ev
+
+
+# =========================================================
+# VALUE RESULT
+# =========================================================
+
+def get_value_result(
+    probability,
+    odd
+):
+
+    ev = expected_value(
+        probability,
+        odd
+    )
+
+    if ev is None:
+        return {
+
+            "ev": None,
+
+            "positive": False
+        }
+
+    return {
+
+        "ev": ev,
+
+        "positive": ev >= 0.03
+    }
+
+# =========================================================
+# MARKET MOVEMENT V4
+# =========================================================
+
+def market_movement(
+    opening_odd,
+    current_odd
+):
+
+    opening_odd = safe_float(
+        opening_odd
+    )
+
+    current_odd = safe_float(
+        current_odd
+    )
+
+    if (
+        opening_odd is None
+        or
+        current_odd is None
+        or
+        opening_odd <= 1.01
+        or
+        current_odd <= 1.01
+    ):
+
+        return {
+            "movement": 0,
+            "trend": "UNKNOWN"
+        }
+
+    movement = (
+        (
+            opening_odd -
+            current_odd
+        )
+        /
+        opening_odd
+    ) * 100
+
+    movement = round(
+        movement,
+        2
+    )
+
+    if movement >= 5:
+
+        trend = "SUPPORT"
+
+    elif movement <= -5:
+
+        trend = "AGAINST"
+
+    else:
+
+        trend = "NEUTRAL"
+
+    return {
+
+        "movement": movement,
+
+        "trend": trend
+    }
+
+# =========================================================
+# AI SIGNAL STABILITY V4
+# =========================================================
+
+from collections import deque
+
+STABILITY_CACHE = {}
+
+
+def update_signal_stability(
+    fixture_id,
+    confidence,
+    attack,
+    pressure
+):
+    """
+    Проверява дали сигналът е стабилен
+    през няколко последователни скана.
+
+    Не създава сигнал самостоятелно.
+    Само потвърждава вече силен сигнал.
+    """
+
+    if not fixture_id:
+        return False, 0
+
+    if fixture_id not in STABILITY_CACHE:
+
+        STABILITY_CACHE[fixture_id] = deque(
+            maxlen=4
+        )
+
+    history = STABILITY_CACHE[fixture_id]
+
+    history.append({
+
+        "confidence": safe_float(
+            confidence,
+            0
+        ),
+
+        "attack": safe_float(
+            attack,
+            0
+        ),
+
+        "pressure": safe_float(
+            pressure,
+            0
+        )
+
+    })
+
+    # Need several scans
+    if len(history) < 3:
+
+        return False, 0
+
+    avg_confidence = (
+
+        sum(
+            x["confidence"]
+            for x in history
+        )
+        /
+        len(history)
+
+    )
+
+    avg_attack = (
+
+        sum(
+            x["attack"]
+            for x in history
+        )
+        /
+        len(history)
+
+    )
+
+    avg_pressure = (
+
+        sum(
+            x["pressure"]
+            for x in history
+        )
+        /
+        len(history)
+
+    )
+
+    stability = (
+
+        avg_confidence * 0.50
+        +
+        avg_attack * 0.25
+        +
+        avg_pressure * 0.25
+
+    )
+
+    stability = round(
+        stability,
+        1
+    )
+
+    return (
+        stability >= 80,
+        stability
+    )
+
+
+# =========================================================
+# AI UNCERTAINTY GATE V4
+# =========================================================
+
+def uncertainty_score(
+    confidence,
+    quality,
+    reliability,
+    stability,
+    risk
+):
+    """
+    Един прост uncertainty gate.
+
+    Не добавя нови бонуси.
+    Целта е да спре несигурните сигнали.
+    """
+
+    confidence = safe_float(
+        confidence,
+        0
+    )
+
+    quality = safe_float(
+        quality,
+        0
+    )
+
+    reliability = safe_float(
+        reliability,
+        0
+    )
+
+    stability = safe_float(
+        stability,
+        0
+    )
+
+    risk = safe_float(
+        risk,
+        100
+    )
+
+    uncertainty = 100
+
+    uncertainty -= confidence * 0.25
+
+    uncertainty -= quality * 0.20
+
+    uncertainty -= reliability * 0.20
+
+    uncertainty -= stability * 0.20
+
+    uncertainty += risk * 0.15
+
+    return round(
+        max(
+            0,
+            min(
+                100,
+                uncertainty
+            )
+        ),
+        1
+    )
+
+
+def uncertainty_allowed(
+    confidence,
+    quality,
+    reliability,
+    stability,
+    risk
+):
+
+    uncertainty = uncertainty_score(
+
+        confidence,
+        quality,
+        reliability,
+        stability,
+        risk
+
+    )
+
+    return (
+        uncertainty <= 25,
+        uncertainty
+    )
+
+
+# =========================================================
+# AI SIMPLE BAYESIAN UPDATE V4
+# =========================================================
+
+def bayesian_update(
+    probability,
+    evidence_strength
+):
+    """
+    Малка корекция на вероятността
+    според новото live доказателство.
+
+    Не позволява огромни скокове.
+    """
+
+    probability = safe_float(
+        probability,
+        0
+    )
+
+    evidence_strength = safe_float(
+        evidence_strength,
+        50
+    )
+
+    probability = max(
+        1,
+        min(
+            99,
+            probability
+        )
+    )
+
+    evidence_strength = max(
+        0,
+        min(
+            100,
+            evidence_strength
+        )
+    )
+
+    # Evidence around 50 = no change
+    adjustment = (
+        evidence_strength - 50
+    ) * 0.12
+
+    updated = (
+        probability
+        +
+        adjustment
+    )
+
+    # Important:
+    # Bayesian update cannot move probability
+    # by more than 6 points in one scan.
+    maximum_change = 6
+
+    updated = max(
+        probability - maximum_change,
+        min(
+            probability + maximum_change,
+            updated
+        )
+    )
+
+    return round(
+        max(
+            1,
+            min(
+                99,
+                updated
+            )
+        ),
+        1
+    )
+
+
+# =========================================================
+# AI CAUSAL CONFIRMATION V4
+# =========================================================
+
+def causal_confirmation(
+    pressure,
+    attack,
+    xg,
+    shots_on,
+    dangerous_attacks
+):
+    """
+    Проверява дали силната статистика има
+    реална подкрепа от няколко независими
+    live показателя.
+
+    Не е отделен signal engine.
+    """
+
+    pressure = safe_float(
+        pressure,
+        0
+    )
+
+    attack = safe_float(
+        attack,
+        0
+    )
+
+    xg = safe_float(
+        xg,
+        0
+    )
+
+    shots_on = safe_float(
+        shots_on,
+        0
+    )
+
+    dangerous_attacks = safe_float(
+        dangerous_attacks,
+        0
+    )
+
+    confirmations = 0
+
+    if pressure >= 80:
+
+        confirmations += 1
+
+    if attack >= 80:
+
+        confirmations += 1
+
+    if xg >= 1.50:
+
+        confirmations += 1
+
+    if shots_on >= 4:
+
+        confirmations += 1
+
+    if dangerous_attacks >= 40:
+
+        confirmations += 1
+
+    return confirmations
+
+
+# =========================================================
+# AI FINAL LIVE QUALITY GATE V4
+# =========================================================
+
+def final_live_quality_gate(
+    probability,
+    confidence,
+    quality,
+    risk,
+    reliability,
+    stability,
+    confirmations
+):
+    """
+    Последна проверка преди сигнал.
+
+    Важно:
+    този gate НЕ създава сигнал.
+    Той само отсява слабите.
+    """
+
+    probability = safe_float(
+        probability,
+        0
+    )
+
+    confidence = safe_float(
+        confidence,
+        0
+    )
+
+    quality = safe_float(
+        quality,
+        0
+    )
+
+    risk = safe_float(
+        risk,
+        100
+    )
+
+    reliability = safe_float(
+        reliability,
+        0
+    )
+
+    stability = safe_float(
+        stability,
+        0
+    )
+
+    confirmations = int(
+        safe_float(
+            confirmations,
+            0
+        )
+    )
+
+    # Minimum core quality
+    if probability < 75:
+
+        return False
+
+    if confidence < 80:
+
+        return False
+
+    if quality < 75:
+
+        return False
+
+    # Risk
+    if risk > 35:
+
+        return False
+
+    # Data quality
+    if reliability < 80:
+
+        return False
+
+    # Stable signal
+    if stability < 80:
+
+        return False
+
+    # At least two real confirmations
+    if confirmations < 2:
+
+        return False
+
+    return True
+
+# =========================================================
+# AI RESULT LEARNING + MARKET MEMORY V4
+# =========================================================
+
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+
+# =========================================================
+# GLOBAL LEARNING MEMORY
+# =========================================================
+
+RESULT_MEMORY = []
+
+MARKET_MEMORY = {}
+
+LEAGUE_MEMORY = {}
+
+CONFIDENCE_MEMORY = {}
+
+ODDS_MEMORY = {}
+
+LIVE_MEMORY = {}
+
+PREMATCH_MEMORY = {}
+
+
+# =========================================================
+# SAFE RESULT NORMALIZER
+# =========================================================
+
+def normalize_result(result):
+
+    if result is None:
+        return None
+
+    result = str(
+        result
+    ).strip().upper()
+
+    if result in (
+        "WIN",
+        "W"
+    ):
+        return "WIN"
+
+    if result in (
+        "LOSS",
+        "LOSE",
+        "L",
+        "LOST"
+    ):
+        return "LOSS"
+
+    if result in (
+        "PENDING",
+        "OPEN",
+        "WAIT"
+    ):
+        return "PENDING"
 
     return None
 
-# ===== SMART STAKE =====
-def calculate_stake(score):
-    if score >= 85:
-        return round(BANKROLL * 0.2, 2)
-    elif score >= 83:
-        return round(BANKROLL * 0.15, 2)
-    elif score >= 80:
-        return round(BANKROLL * 0.1, 2)
+
+# =========================================================
+# SAFE MARKET NAME
+# =========================================================
+
+def normalize_market(market):
+
+    if market is None:
+        return "UNKNOWN"
+
+    return str(
+        market
+    ).strip()
+
+
+# =========================================================
+# RESULT MEMORY ENTRY
+# =========================================================
+
+def save_result_memory(signal):
+
+    if not signal:
+        return False
+
+    result = normalize_result(
+        signal.get(
+            "result"
+        )
+    )
+
+    if result not in (
+        "WIN",
+        "LOSS"
+    ):
+        return False
+
+    entry = {
+
+        "fixture_id":
+            signal.get(
+                "fixture_id"
+            ),
+
+        "market":
+            normalize_market(
+                signal.get(
+                    "market"
+                )
+            ),
+
+        "result":
+            result,
+
+        "odd":
+            safe_float(
+                signal.get(
+                    "odd"
+                ),
+                0
+            ),
+
+        "probability":
+            safe_float(
+                signal.get(
+                    "probability"
+                ),
+                0
+            ),
+
+        "confidence":
+            safe_float(
+                signal.get(
+                    "confidence"
+                ),
+                0
+            ),
+
+        "quality":
+            safe_float(
+                signal.get(
+                    "quality"
+                ),
+                0
+            ),
+
+        "risk":
+            safe_float(
+                signal.get(
+                    "risk"
+                ),
+                100
+            ),
+
+        "league":
+            signal.get(
+                "league",
+                "UNKNOWN"
+            ),
+
+        "country":
+            signal.get(
+                "country",
+                "UNKNOWN"
+            ),
+
+        "minute":
+            safe_float(
+                signal.get(
+                    "minute"
+                ),
+                0
+            ),
+
+        "created_at":
+            signal.get(
+                "created_at"
+            )
+            or
+            datetime.now().isoformat()
+
+    }
+
+    RESULT_MEMORY.append(
+        entry
+    )
+
+    return True
+
+
+# =========================================================
+# ROI CALCULATOR
+# =========================================================
+
+def calculate_roi(
+    results
+):
+
+    if not results:
+        return 0
+
+    profit = 0
+    stakes = 0
+
+    for item in results:
+
+        result = normalize_result(
+            item.get(
+                "result"
+            )
+        )
+
+        odd = safe_float(
+            item.get(
+                "odd"
+            ),
+            0
+        )
+
+        if (
+            result not in (
+                "WIN",
+                "LOSS"
+            )
+            or
+            odd <= 1.01
+        ):
+            continue
+
+        stakes += 1
+
+        if result == "WIN":
+
+            profit += (
+                odd - 1
+            )
+
+        else:
+
+            profit -= 1
+
+    if stakes == 0:
+        return 0
+
+    return round(
+        (
+            profit /
+            stakes
+        ) * 100,
+        2
+    )
+
+
+# =========================================================
+# WINRATE
+# =========================================================
+
+def calculate_memory_winrate(
+    results
+):
+
+    valid = [
+
+        x for x in results
+
+        if normalize_result(
+            x.get(
+                "result"
+            )
+        ) in (
+            "WIN",
+            "LOSS"
+        )
+
+    ]
+
+    if not valid:
+        return 0
+
+    wins = sum(
+
+        1
+
+        for x in valid
+
+        if normalize_result(
+            x.get(
+                "result"
+            )
+        ) == "WIN"
+
+    )
+
+    return round(
+        wins * 100 / len(valid),
+        2
+    )
+
+
+# =========================================================
+# SAMPLE QUALITY
+# =========================================================
+
+def sample_quality(
+    results
+):
+
+    total = len(
+        results
+    )
+
+    if total < 10:
+
+        return "VERY_SMALL"
+
+    if total < 25:
+
+        return "SMALL"
+
+    if total < 50:
+
+        return "MEDIUM"
+
+    if total < 100:
+
+        return "GOOD"
+
+    return "STRONG"
+
+
+# =========================================================
+# MARKET MEMORY
+# =========================================================
+
+def rebuild_market_memory():
+
+    global MARKET_MEMORY
+
+    MARKET_MEMORY = {}
+
+    grouped = defaultdict(
+        list
+    )
+
+    for signal in RESULT_MEMORY:
+
+        market = normalize_market(
+            signal.get(
+                "market"
+            )
+        )
+
+        grouped[
+            market
+        ].append(
+            signal
+        )
+
+    for market, results in grouped.items():
+
+        wins = sum(
+
+            1
+
+            for x in results
+
+            if normalize_result(
+                x.get(
+                    "result"
+                )
+            ) == "WIN"
+
+        )
+
+        losses = sum(
+
+            1
+
+            for x in results
+
+            if normalize_result(
+                x.get(
+                    "result"
+                )
+            ) == "LOSS"
+
+        )
+
+        total = (
+            wins +
+            losses
+        )
+
+        if total == 0:
+            continue
+
+        MARKET_MEMORY[
+            market
+        ] = {
+
+            "market":
+                market,
+
+            "signals":
+                total,
+
+            "wins":
+                wins,
+
+            "losses":
+                losses,
+
+            "winrate":
+                round(
+                    wins * 100 / total,
+                    2
+                ),
+
+            "roi":
+                calculate_roi(
+                    results
+                ),
+
+            "sample":
+                sample_quality(
+                    results
+                )
+
+        }
+
+    return MARKET_MEMORY
+
+
+# =========================================================
+# LEAGUE MEMORY
+# =========================================================
+
+def rebuild_league_memory():
+
+    global LEAGUE_MEMORY
+
+    LEAGUE_MEMORY = {}
+
+    grouped = defaultdict(
+        list
+    )
+
+    for signal in RESULT_MEMORY:
+
+        league = signal.get(
+            "league",
+            "UNKNOWN"
+        )
+
+        grouped[
+            league
+        ].append(
+            signal
+        )
+
+    for league, results in grouped.items():
+
+        valid = [
+
+            x for x in results
+
+            if normalize_result(
+                x.get(
+                    "result"
+                )
+            ) in (
+                "WIN",
+                "LOSS"
+            )
+
+        ]
+
+        if not valid:
+            continue
+
+        wins = sum(
+
+            1
+
+            for x in valid
+
+            if normalize_result(
+                x.get(
+                    "result"
+                )
+            ) == "WIN"
+
+        )
+
+        total = len(
+            valid
+        )
+
+        LEAGUE_MEMORY[
+            league
+        ] = {
+
+            "signals":
+                total,
+
+            "wins":
+                wins,
+
+            "losses":
+                total - wins,
+
+            "winrate":
+                round(
+                    wins * 100 / total,
+                    2
+                ),
+
+            "roi":
+                calculate_roi(
+                    valid
+                ),
+
+            "sample":
+                sample_quality(
+                    valid
+                )
+
+        }
+
+    return LEAGUE_MEMORY
+
+
+# =========================================================
+# CONFIDENCE BAND MEMORY
+# =========================================================
+
+def confidence_band(
+    confidence
+):
+
+    confidence = safe_float(
+        confidence,
+        0
+    )
+
+    if confidence < 75:
+        return "<75"
+
+    if confidence < 80:
+        return "75-79"
+
+    if confidence < 85:
+        return "80-84"
+
+    if confidence < 90:
+        return "85-89"
+
+    return "90+"
+
+
+def rebuild_confidence_memory():
+
+    global CONFIDENCE_MEMORY
+
+    CONFIDENCE_MEMORY = {}
+
+    grouped = defaultdict(
+        list
+    )
+
+    for signal in RESULT_MEMORY:
+
+        band = confidence_band(
+            signal.get(
+                "confidence"
+            )
+        )
+
+        grouped[
+            band
+        ].append(
+            signal
+        )
+
+    for band, results in grouped.items():
+
+        valid = [
+
+            x for x in results
+
+            if normalize_result(
+                x.get(
+                    "result"
+                )
+            ) in (
+                "WIN",
+                "LOSS"
+            )
+
+        ]
+
+        if not valid:
+            continue
+
+        CONFIDENCE_MEMORY[
+            band
+        ] = {
+
+            "signals":
+                len(valid),
+
+            "winrate":
+                calculate_memory_winrate(
+                    valid
+                ),
+
+            "roi":
+                calculate_roi(
+                    valid
+                )
+
+        }
+
+    return CONFIDENCE_MEMORY
+
+
+# =========================================================
+# ODDS BAND MEMORY
+# =========================================================
+
+def odds_band(
+    odd
+):
+
+    odd = safe_float(
+        odd,
+        0
+    )
+
+    if odd <= 1.01:
+        return "INVALID"
+
+    if odd < 1.30:
+        return "1.01-1.29"
+
+    if odd < 1.50:
+        return "1.30-1.49"
+
+    if odd < 1.75:
+        return "1.50-1.74"
+
+    if odd < 2.00:
+        return "1.75-1.99"
+
+    if odd < 2.50:
+        return "2.00-2.49"
+
+    return "2.50+"
+
+
+def rebuild_odds_memory():
+
+    global ODDS_MEMORY
+
+    ODDS_MEMORY = {}
+
+    grouped = defaultdict(
+        list
+    )
+
+    for signal in RESULT_MEMORY:
+
+        band = odds_band(
+            signal.get(
+                "odd"
+            )
+        )
+
+        if band == "INVALID":
+            continue
+
+        grouped[
+            band
+        ].append(
+            signal
+        )
+
+    for band, results in grouped.items():
+
+        valid = [
+
+            x for x in results
+
+            if normalize_result(
+                x.get(
+                    "result"
+                )
+            ) in (
+                "WIN",
+                "LOSS"
+            )
+
+        ]
+
+        if not valid:
+            continue
+
+        ODDS_MEMORY[
+            band
+        ] = {
+
+            "signals":
+                len(valid),
+
+            "winrate":
+                calculate_memory_winrate(
+                    valid
+                ),
+
+            "roi":
+                calculate_roi(
+                    valid
+                )
+
+        }
+
+    return ODDS_MEMORY
+
+
+# =========================================================
+# LIVE / PREMATCH MEMORY
+# =========================================================
+
+def detect_signal_mode(
+    signal
+):
+
+    market = str(
+        signal.get(
+            "market",
+            ""
+        )
+    ).upper()
+
+    minute = safe_float(
+        signal.get(
+            "minute"
+        ),
+        0
+    )
+
+    if (
+        "NEXT GOAL" in market
+        or
+        minute > 0
+    ):
+
+        return "LIVE"
+
+    return "PREMATCH"
+
+
+def rebuild_mode_memory():
+
+    global LIVE_MEMORY
+    global PREMATCH_MEMORY
+
+    LIVE_MEMORY = {}
+    PREMATCH_MEMORY = {}
+
+    live = []
+    prematch = []
+
+    for signal in RESULT_MEMORY:
+
+        mode = detect_signal_mode(
+            signal
+        )
+
+        if mode == "LIVE":
+
+            live.append(
+                signal
+            )
+
+        else:
+
+            prematch.append(
+                signal
+            )
+
+    for name, data in (
+        ("LIVE", live),
+        ("PREMATCH", prematch)
+    ):
+
+        if not data:
+            continue
+
+        target = (
+            LIVE_MEMORY
+            if name == "LIVE"
+            else PREMATCH_MEMORY
+        )
+
+        target.update({
+
+            "signals":
+                len(data),
+
+            "winrate":
+                calculate_memory_winrate(
+                    data
+                ),
+
+            "roi":
+                calculate_roi(
+                    data
+                )
+
+        })
+
+    return (
+        LIVE_MEMORY,
+        PREMATCH_MEMORY
+    )
+
+
+# =========================================================
+# MARKET DECISION FROM HISTORY
+# =========================================================
+
+def historical_market_score(
+    market
+):
+
+    market = normalize_market(
+        market
+    )
+
+    data = MARKET_MEMORY.get(
+        market
+    )
+
+    if not data:
+        return {
+
+            "score": 50,
+
+            "known": False,
+
+            "reason":
+                "No historical data"
+
+        }
+
+    total = data.get(
+        "signals",
+        0
+    )
+
+    winrate = data.get(
+        "winrate",
+        0
+    )
+
+    roi = data.get(
+        "roi",
+        0
+    )
+
+    # No aggressive learning
+    score = 50
+
+    # Winrate contribution
+    if winrate >= 85:
+        score += 15
+
+    elif winrate >= 80:
+        score += 10
+
+    elif winrate >= 75:
+        score += 5
+
+    elif winrate < 65:
+        score -= 10
+
+    # ROI contribution
+    if roi >= 10:
+        score += 10
+
+    elif roi >= 5:
+        score += 5
+
+    elif roi < 0:
+        score -= 10
+
+    # Sample-size protection
+    if total < 20:
+
+        score = (
+            50 +
+            (
+                score - 50
+            ) * 0.35
+        )
+
+    elif total < 50:
+
+        score = (
+            50 +
+            (
+                score - 50
+            ) * 0.65
+        )
+
+    return {
+
+        "score":
+            round(
+                max(
+                    0,
+                    min(
+                        100,
+                        score
+                    )
+                ),
+                1
+            ),
+
+        "known":
+            True,
+
+        "signals":
+            total,
+
+        "winrate":
+            winrate,
+
+        "roi":
+            roi,
+
+        "sample":
+            data.get(
+                "sample"
+            )
+
+    }
+
+
+# =========================================================
+# MARKET BLOCK DECISION
+# =========================================================
+
+def should_block_market(
+    market
+):
+
+    data = MARKET_MEMORY.get(
+        normalize_market(
+            market
+        )
+    )
+
+    if not data:
+        return False
+
+    total = data.get(
+        "signals",
+        0
+    )
+
+    winrate = data.get(
+        "winrate",
+        0
+    )
+
+    roi = data.get(
+        "roi",
+        0
+    )
+
+    # We NEVER block from a tiny sample.
+    if total < 30:
+        return False
+
+    # Strong evidence of bad market.
+    if (
+        total >= 50
+        and
+        winrate < 62
+        and
+        roi < -5
+    ):
+
+        return True
+
+    return False
+
+
+# =========================================================
+# LEAGUE HISTORICAL SCORE
+# =========================================================
+
+def historical_league_score(
+    league
+):
+
+    league = (
+        league
+        or
+        "UNKNOWN"
+    )
+
+    data = LEAGUE_MEMORY.get(
+        league
+    )
+
+    if not data:
+
+        return {
+
+            "score": 50,
+
+            "known": False
+
+        }
+
+    total = data.get(
+        "signals",
+        0
+    )
+
+    winrate = data.get(
+        "winrate",
+        0
+    )
+
+    roi = data.get(
+        "roi",
+        0
+    )
+
+    score = 50
+
+    if winrate >= 85:
+        score += 10
+
+    elif winrate >= 80:
+        score += 7
+
+    elif winrate >= 75:
+        score += 4
+
+    elif winrate < 65:
+        score -= 8
+
+    if roi >= 10:
+        score += 8
+
+    elif roi >= 5:
+        score += 4
+
+    elif roi < 0:
+        score -= 8
+
+    # Sample protection
+    if total < 20:
+
+        score = (
+            50 +
+            (
+                score - 50
+            ) * 0.35
+        )
+
+    elif total < 50:
+
+        score = (
+            50 +
+            (
+                score - 50
+            ) * 0.65
+        )
+
+    return {
+
+        "score":
+            round(
+                max(
+                    0,
+                    min(
+                        100,
+                        score
+                    )
+                ),
+                1
+            ),
+
+        "known":
+            True,
+
+        "signals":
+            total,
+
+        "winrate":
+            winrate,
+
+        "roi":
+            roi
+
+    }
+
+
+# =========================================================
+# COMPLETE MEMORY REBUILD
+# =========================================================
+
+def rebuild_all_learning_memory():
+
+    rebuild_market_memory()
+
+    rebuild_league_memory()
+
+    rebuild_confidence_memory()
+
+    rebuild_odds_memory()
+
+    rebuild_mode_memory()
+
+    return {
+
+        "results":
+            len(
+                RESULT_MEMORY
+            ),
+
+        "markets":
+            len(
+                MARKET_MEMORY
+            ),
+
+        "leagues":
+            len(
+                LEAGUE_MEMORY
+            ),
+
+        "confidence_bands":
+            len(
+                CONFIDENCE_MEMORY
+            ),
+
+        "odds_bands":
+            len(
+                ODDS_MEMORY
+            ),
+
+        "live_signals":
+            LIVE_MEMORY.get(
+                "signals",
+                0
+            ),
+
+        "prematch_signals":
+            PREMATCH_MEMORY.get(
+                "signals",
+                0
+            )
+
+    }
+
+
+# =========================================================
+# LEARNING BONUS
+# =========================================================
+
+def learning_bonus(
+    market,
+    league
+):
+
+    market_data = historical_market_score(
+        market
+    )
+
+    league_data = historical_league_score(
+        league
+    )
+
+    market_score = market_data.get(
+        "score",
+        50
+    )
+
+    league_score = league_data.get(
+        "score",
+        50
+    )
+
+    # Market history is more important
+    bonus = (
+
+        (
+            market_score - 50
+        ) * 0.12
+
+        +
+
+        (
+            league_score - 50
+        ) * 0.08
+
+    )
+
+    return round(
+        max(
+            -10,
+            min(
+                10,
+                bonus
+            )
+        ),
+        2
+    )
+
+
+# =========================================================
+# LEARNING GATE
+# =========================================================
+
+def historical_learning_gate(
+    market,
+    league
+):
+
+    market = normalize_market(
+        market
+    )
+
+    # Never send a known bad market
+    if should_block_market(
+        market
+    ):
+
+        return {
+
+            "allowed":
+                False,
+
+            "reason":
+                "Historical market performance is weak",
+
+            "bonus":
+                -10
+
+        }
+
+    bonus = learning_bonus(
+        market,
+        league
+    )
+
+    return {
+
+        "allowed":
+            True,
+
+        "reason":
+            "Historical performance accepted",
+
+        "bonus":
+            bonus
+
+    }
+
+
+# =========================================================
+# LEARNING REPORT
+# =========================================================
+
+def learning_report_v4():
+
+    rebuild_all_learning_memory()
+
+    best_market = None
+    best_roi = -999
+
+    for market, data in MARKET_MEMORY.items():
+
+        if data.get(
+            "signals",
+            0
+        ) < 20:
+
+            continue
+
+        roi = data.get(
+            "roi",
+            0
+        )
+
+        if roi > best_roi:
+
+            best_roi = roi
+
+            best_market = market
+
+    worst_market = None
+    worst_roi = 999
+
+    for market, data in MARKET_MEMORY.items():
+
+        if data.get(
+            "signals",
+            0
+        ) < 20:
+
+            continue
+
+        roi = data.get(
+            "roi",
+            0
+        )
+
+        if roi < worst_roi:
+
+            worst_roi = roi
+
+            worst_market = market
+
+    return {
+
+        "memory":
+            len(
+                RESULT_MEMORY
+            ),
+
+        "markets":
+            len(
+                MARKET_MEMORY
+            ),
+
+        "leagues":
+            len(
+                LEAGUE_MEMORY
+            ),
+
+        "best_market":
+            best_market,
+
+        "best_market_roi":
+            (
+                best_roi
+                if best_market
+                else 0
+            ),
+
+        "worst_market":
+            worst_market,
+
+        "worst_market_roi":
+            (
+                worst_roi
+                if worst_market
+                else 0
+            ),
+
+        "live":
+            LIVE_MEMORY,
+
+        "prematch":
+            PREMATCH_MEMORY
+
+    }
+
+
+# =========================================================
+# DEBUG LEARNING REPORT
+# =========================================================
+
+def print_learning_report():
+
+    report = learning_report_v4()
+
+    print(
+        "\n"
+        "=================================================\n"
+        "🧠 AI LEARNING MEMORY V4\n"
+        "=================================================\n"
+    )
+
+    print(
+        "TOTAL RESULTS:",
+        report.get(
+            "memory",
+            0
+        )
+    )
+
+    print(
+        "MARKETS:",
+        report.get(
+            "markets",
+            0
+        )
+    )
+
+    print(
+        "LEAGUES:",
+        report.get(
+            "leagues",
+            0
+        )
+    )
+
+    print(
+        "BEST MARKET:",
+        report.get(
+            "best_market"
+        )
+    )
+
+    print(
+        "BEST ROI:",
+        report.get(
+            "best_market_roi",
+            0
+        )
+    )
+
+    print(
+        "WORST MARKET:",
+        report.get(
+            "worst_market"
+        )
+    )
+
+    print(
+        "WORST ROI:",
+        report.get(
+            "worst_market_roi",
+            0
+        )
+    )
+
+    print(
+        "LIVE:",
+        report.get(
+            "live"
+        )
+    )
+
+    print(
+        "PREMATCH:",
+        report.get(
+            "prematch"
+        )
+    )
+
+    print(
+        "=================================================\n"
+    )
+
+
+# =========================================================
+# END RESULT LEARNING V4
+# =========================================================
+
+# =========================================================
+# RESULT TRACKER V4
+# =========================================================
+
+RESULT_CHECK_INTERVAL = 300
+
+
+# =========================================================
+# DATABASE MIGRATION
+# =========================================================
+
+def upgrade_database():
+
+    conn = sqlite3.connect(DB_NAME)
+
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(signals)")
+
+    columns = {
+        row[1]
+        for row in cursor.fetchall()
+    }
+
+    required_columns = {
+
+        "status": "TEXT",
+
+        "checked_at": "TEXT",
+
+        "home_goals": "INTEGER",
+
+        "away_goals": "INTEGER",
+
+        "fixture_status": "TEXT",
+
+        "stake": "REAL",
+
+        "profit": "REAL"
+
+    }
+
+    for column, data_type in required_columns.items():
+
+        if column not in columns:
+
+            try:
+
+                cursor.execute(
+
+                    f"ALTER TABLE signals "
+                    f"ADD COLUMN {column} {data_type}"
+
+                )
+
+            except Exception as e:
+
+                logging.warning(
+
+                    "DB MIGRATION ERROR %s: %s",
+
+                    column,
+
+                    repr(e)
+
+                )
+
+    conn.commit()
+
+    conn.close()
+
+
+# =========================================================
+# INIT DATABASE
+# =========================================================
+
+init_database()
+
+upgrade_database()
+
+
+# =========================================================
+# GET FIXTURE RESULT
+# =========================================================
+
+
+
+# =========================================================
+# FINISHED STATUS
+# =========================================================
+
+FINISHED_STATUSES = {
+
+    "FT",
+
+    "AET",
+
+    "PEN"
+
+}
+
+
+def is_finished_status(status):
+
+    return status in FINISHED_STATUSES
+
+
+# =========================================================
+# MARKET RESULT ENGINE
+# =========================================================
+
+def evaluate_market_result(
+
+    market,
+
+    home_goals,
+
+    away_goals
+
+):
+
+    total_goals = (
+
+        home_goals +
+
+        away_goals
+
+    )
+
+    # -----------------------------------------------------
+    # HOME WIN
+    # -----------------------------------------------------
+
+    if market in (
+
+        "🏆 HOME WIN",
+
+        "HOME WIN"
+
+    ):
+
+        if home_goals > away_goals:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # AWAY WIN
+    # -----------------------------------------------------
+
+    if market in (
+
+        "✈️ AWAY WIN",
+
+        "✈ AWAY WIN",
+
+        "AWAY WIN"
+
+    ):
+
+        if away_goals > home_goals:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # OVER 2.5
+    # -----------------------------------------------------
+
+    if market in (
+
+        "🚀 OVER 2.5",
+
+        "⚽ OVER 2.5",
+
+        "OVER 2.5"
+
+    ):
+
+        if total_goals >= 3:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # UNDER 2.5
+    # -----------------------------------------------------
+
+    if market in (
+
+        "🛡 UNDER 2.5",
+
+        "UNDER 2.5"
+
+    ):
+
+        if total_goals <= 2:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # OVER 3.5
+    # -----------------------------------------------------
+
+    if market in (
+
+        "🔥 OVER 3.5",
+
+        "OVER 3.5"
+
+    ):
+
+        if total_goals >= 4:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # UNDER 3.5
+    # -----------------------------------------------------
+
+    if market in (
+
+        "🛡 UNDER 3.5",
+
+        "UNDER 3.5"
+
+    ):
+
+        if total_goals <= 3:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # BTTS
+    # -----------------------------------------------------
+
+    if market in (
+
+        "💎 BTTS",
+
+        "💎 BTTS YES",
+
+        "BTTS",
+
+        "BTTS YES"
+
+    ):
+
+        if (
+
+            home_goals > 0
+
+            and
+
+            away_goals > 0
+
+        ):
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # HOME OVER 1.5
+    # -----------------------------------------------------
+
+    if market in (
+
+        "⚽ HOME OVER 1.5",
+
+        "HOME OVER 1.5"
+
+    ):
+
+        if home_goals >= 2:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # AWAY OVER 1.5
+    # -----------------------------------------------------
+
+    if market in (
+
+        "⚽ AWAY OVER 1.5",
+
+        "AWAY OVER 1.5"
+
+    ):
+
+        if away_goals >= 2:
+
+            return "WIN"
+
+        return "LOSS"
+
+    # -----------------------------------------------------
+    # NEXT GOAL
+    # -----------------------------------------------------
+
+    if "NEXT GOAL" in str(market):
+
+        return "PENDING"
+
+    # -----------------------------------------------------
+    # UNKNOWN MARKET
+    # -----------------------------------------------------
+
+    return "PENDING"
+
+
+# =========================================================
+# SIGNAL PROFIT
+# =========================================================
+
+def calculate_signal_profit(
+
+    result,
+
+    odd,
+
+    stake=1.0
+
+):
+
+    if result == "WIN":
+
+        if odd is None:
+
+            return None
+
+        return round(
+
+            (odd - 1) * stake,
+
+            2
+
+        )
+
+    if result == "LOSS":
+
+        return round(
+
+            -stake,
+
+            2
+
+        )
+
+    return 0.0
+
+
+# =========================================================
+# UPDATE SINGLE SIGNAL
+# =========================================================
+
+
+
+# =========================================================
+# CHECK ALL PENDING SIGNALS
+# =========================================================
+
+
+
+# =========================================================
+# MARKET PERFORMANCE
+# =========================================================
+
+def get_market_performance(
+
+    market=None
+
+):
+
+    conn = sqlite3.connect(
+
+        DB_NAME
+
+    )
+
+    cursor = conn.cursor()
+
+    if market:
+
+        cursor.execute(
+
+            """
+
+            SELECT
+
+                COUNT(*),
+
+                SUM(
+
+                    CASE
+
+                        WHEN result='WIN'
+
+                        THEN 1
+
+                        ELSE 0
+
+                    END
+
+                ),
+
+                COALESCE(
+
+                    SUM(profit),
+
+                    0
+
+                )
+
+            FROM signals
+
+            WHERE
+
+                market=?
+
+                AND result IN (
+
+                    'WIN',
+
+                    'LOSS'
+
+                )
+
+            """,
+
+            (
+
+                market,
+
+            )
+
+        )
+
     else:
-        return round(BANKROLL * 0.05, 2)
 
-def should_play(score):
-    if MODE == "SAFE":
-        return score >= 80
-    return score >= 75
+        cursor.execute(
 
-# ===== COMMANDS =====
-async def safe_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MODE
-    MODE = "SAFE"
-    await update.message.reply_text("🟢 SAFE MODE")
+            """
 
-async def aggressive_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MODE
-    MODE = "AGGRESSIVE"
-    await update.message.reply_text("🔥 AGGRESSIVE MODE")
+            SELECT
 
-# ===== LOOP =====
-async def monitor():
+                COUNT(*),
+
+                SUM(
+
+                    CASE
+
+                        WHEN result='WIN'
+
+                        THEN 1
+
+                        ELSE 0
+
+                    END
+
+                ),
+
+                COALESCE(
+
+                    SUM(profit),
+
+                    0
+
+                )
+
+            FROM signals
+
+            WHERE result IN (
+
+                'WIN',
+
+                'LOSS'
+
+            )
+
+            """
+
+        )
+
+    row = cursor.fetchone()
+
+    conn.close()
+
+    total = row[0] or 0
+
+    wins = row[1] or 0
+
+    profit = row[2] or 0.0
+
+    if total == 0:
+
+        return {
+
+            "total": 0,
+
+            "wins": 0,
+
+            "losses": 0,
+
+            "winrate": 0.0,
+
+            "profit": 0.0,
+
+            "roi": 0.0
+
+        }
+
+    losses = total - wins
+
+    winrate = (
+
+        wins /
+
+        total *
+
+        100
+
+    )
+
+    roi = (
+
+        profit /
+
+        total *
+
+        100
+
+    )
+
+    return {
+
+        "total": total,
+
+        "wins": wins,
+
+        "losses": losses,
+
+        "winrate": round(
+
+            winrate,
+
+            2
+
+        ),
+
+        "profit": round(
+
+            profit,
+
+            2
+
+        ),
+
+        "roi": round(
+
+            roi,
+
+            2
+
+        )
+
+    }
+
+
+# =========================================================
+# ALL MARKET PERFORMANCE
+# =========================================================
+
+def get_all_market_performance():
+
+    conn = sqlite3.connect(
+
+        DB_NAME
+
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+
+        """
+
+        SELECT
+
+            market,
+
+            COUNT(*),
+
+            SUM(
+
+                CASE
+
+                    WHEN result='WIN'
+
+                    THEN 1
+
+                    ELSE 0
+
+                END
+
+            ),
+
+            COALESCE(
+
+                SUM(profit),
+
+                0
+
+            )
+
+        FROM signals
+
+        WHERE result IN (
+
+            'WIN',
+
+            'LOSS'
+
+        )
+
+        GROUP BY market
+
+        ORDER BY COUNT(*) DESC
+
+        """
+
+    )
+
+    rows = cursor.fetchall()
+
+    conn.close()
+
+    report = []
+
+    for market, total, wins, profit in rows:
+
+        losses = total - wins
+
+        winrate = (
+
+            wins /
+
+            total *
+
+            100
+
+        )
+
+        roi = (
+
+            profit /
+
+            total *
+
+            100
+
+        )
+
+        report.append({
+
+            "market": market,
+
+            "total": total,
+
+            "wins": wins,
+
+            "losses": losses,
+
+            "winrate": round(
+
+                winrate,
+
+                1
+
+            ),
+
+            "profit": round(
+
+                profit,
+
+                2
+
+            ),
+
+            "roi": round(
+
+                roi,
+
+                1
+
+            )
+
+        })
+
+    return report
+
+
+# =========================================================
+# QUALITY REPORT
+# =========================================================
+
+
+
+# =========================================================
+# LEARNING FROM REAL RESULTS
+# =========================================================
+
+def get_learning_statistics(
+
+    market,
+
+    limit=100
+
+):
+
+    conn = sqlite3.connect(
+
+        DB_NAME
+
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+
+        """
+
+        SELECT
+
+            result,
+
+            probability,
+
+            confidence,
+
+            odd,
+
+            profit
+
+        FROM signals
+
+        WHERE
+
+            market=?
+
+            AND result IN (
+
+                'WIN',
+
+                'LOSS'
+
+            )
+
+        ORDER BY id DESC
+
+        LIMIT ?
+
+        """,
+
+        (
+
+            market,
+
+            limit
+
+        )
+
+    )
+
+    rows = cursor.fetchall()
+
+    conn.close()
+
+    if not rows:
+
+        return None
+
+    total = len(rows)
+
+    wins = sum(
+
+        1
+
+        for row in rows
+
+        if row[0] == "WIN"
+
+    )
+
+    avg_probability = sum(
+
+        row[1] or 0
+
+        for row in rows
+
+    ) / total
+
+    avg_confidence = sum(
+
+        row[2] or 0
+
+        for row in rows
+
+    ) / total
+
+    avg_odd = sum(
+
+        row[3] or 0
+
+        for row in rows
+
+    ) / total
+
+    profit = sum(
+
+        row[4] or 0
+
+        for row in rows
+
+    )
+
+    return {
+
+        "market": market,
+
+        "total": total,
+
+        "wins": wins,
+
+        "losses": total - wins,
+
+        "winrate": round(
+
+            wins /
+
+            total *
+
+            100,
+
+            2
+
+        ),
+
+        "avg_probability": round(
+
+            avg_probability,
+
+            2
+
+        ),
+
+        "avg_confidence": round(
+
+            avg_confidence,
+
+            2
+
+        ),
+
+        "avg_odd": round(
+
+            avg_odd,
+
+            2
+
+        ),
+
+        "profit": round(
+
+            profit,
+
+            2
+
+        )
+
+    }
+
+
+# =========================================================
+# MARKET LEARNING DECISION
+# =========================================================
+
+def market_learning_decision(
+
+    market
+
+):
+
+    stats = get_learning_statistics(
+
+        market,
+
+        100
+
+    )
+
+    if not stats:
+
+        return {
+
+            "action": "LEARN",
+
+            "reason": "Not enough history",
+
+            "stats": None
+
+        }
+
+    # We do not aggressively change the system.
+    # Only identify clearly weak markets.
+
+    if (
+
+        stats["total"] >= 30
+
+        and
+
+        stats["winrate"] < 60
+
+    ):
+
+        return {
+
+            "action": "REDUCE",
+
+            "reason": "Weak historical performance",
+
+            "stats": stats
+
+        }
+
+    if (
+
+        stats["total"] >= 50
+
+        and
+
+        stats["winrate"] >= 80
+
+    ):
+
+        return {
+
+            "action": "PRIORITIZE",
+
+            "reason": "Strong historical performance",
+
+            "stats": stats
+
+        }
+
+    return {
+
+        "action": "KEEP",
+
+        "reason": "Normal performance",
+
+        "stats": stats
+
+    }
+
+
+# =========================================================
+# RESULT CHECKER
+# =========================================================
+
+
+
+# =========================================================
+# RESULT CHECKER THREAD
+# =========================================================
+
+def result_checker_loop():
+
+    while True:
+
+        try:
+
+            run_result_checker()
+
+        except Exception as e:
+
+            logging.warning(
+
+                "RESULT LOOP ERROR: %s",
+
+                repr(e)
+
+            )
+
+        time.sleep(
+
+            RESULT_CHECK_INTERVAL
+
+        )
+
+
+# =========================================================
+# START RESULT CHECKER
+# =========================================================
+
+def start_result_checker():
+
+    thread = threading.Thread(
+
+        target=result_checker_loop,
+
+        daemon=True
+
+    )
+
+    thread.start()
+
+    return thread
+
+# =========================================================
+# PREMATCH ENGINE V4
+# =========================================================
+
+PREMATCH_MIN_PROBABILITY = 68
+PREMATCH_MIN_CONFIDENCE = 78
+PREMATCH_MIN_ODD = 1.50
+PREMATCH_MAX_ODD = 3.50
+
+MAX_PREMATCH_SIGNALS_PER_SCAN = 5
+
+
+# =========================================================
+# PREMATCH TEAM STRENGTH
+# =========================================================
+
+def prematch_team_strength(form):
+
+    if not form:
+        return 0
+
+    score = 0
+
+    # Attack
+    score += form["avg_scored"] * 18
+
+    # Defence
+    score -= form["avg_conceded"] * 10
+
+    # Overall form
+    score += form["form_pct"] * 0.20
+
+    # Recent form
+    score += form["recent_form_pct"] * 0.25
+
+    # Goal difference
+    score += form["goal_diff"] * 1.5
+
+    # Consistency
+    score += form["scored_pct"] * 0.10
+
+    return round(
+        score,
+        2
+    )
+
+
+# =========================================================
+# PREMATCH PROBABILITY
+# =========================================================
+
+def prematch_probabilities(
+
+    home_form,
+
+    away_form,
+
+    table_home=None,
+
+    table_away=None
+
+):
+
+    home_strength = prematch_team_strength(
+
+        home_form
+
+    )
+
+    away_strength = prematch_team_strength(
+
+        away_form
+
+    )
+
+    # Small home advantage.
+    # Deliberately kept low so it does not overpower form.
+
+    home_strength += 5
+
+    # League table adjustment
+
+    if table_home and table_away:
+
+        rank_diff = (
+
+            table_away["rank"]
+
+            -
+
+            table_home["rank"]
+
+        )
+
+        home_strength += rank_diff * 1.5
+
+        goal_diff_diff = (
+
+            table_home["goal_diff"]
+
+            -
+
+            table_away["goal_diff"]
+
+        )
+
+        home_strength += goal_diff_diff * 0.20
+
+        away_strength += (
+
+            -goal_diff_diff * 0.20
+
+        )
+
+    home_strength = max(
+
+        1,
+
+        home_strength
+
+    )
+
+    away_strength = max(
+
+        1,
+
+        away_strength
+
+    )
+
+    total = (
+
+        home_strength
+
+        +
+
+        away_strength
+
+    )
+
+    home_probability = (
+
+        home_strength
+
+        /
+
+        total
+
+        *
+
+        100
+
+    )
+
+    away_probability = (
+
+        away_strength
+
+        /
+
+        total
+
+        *
+
+        100
+
+    )
+
+    # Draw is estimated separately.
+    # We do not force it into the home/away calculation.
+
+    form_gap = abs(
+
+        home_form["form_pct"]
+
+        -
+
+        away_form["form_pct"]
+
+    )
+
+    draw_probability = max(
+
+        18,
+
+        32 - form_gap * 0.10
+
+    )
+
+    # Normalize
+
+    remaining = (
+
+        home_probability
+
+        +
+
+        away_probability
+
+    )
+
+    factor = (
+
+        100 - draw_probability
+
+    ) / remaining
+
+    home_probability *= factor
+    away_probability *= factor
+
+    return {
+
+        "home_probability": round(
+
+            home_probability,
+
+            1
+
+        ),
+
+        "draw_probability": round(
+
+            draw_probability,
+
+            1
+
+        ),
+
+        "away_probability": round(
+
+            away_probability,
+
+            1
+
+        ),
+
+        "home_strength": round(
+
+            home_strength,
+
+            2
+
+        ),
+
+        "away_strength": round(
+
+            away_strength,
+
+            2
+
+        )
+
+    }
+
+
+# =========================================================
+# PREMATCH GOAL EXPECTATION
+# =========================================================
+
+def prematch_goal_expectation(
+
+    home_form,
+
+    away_form
+
+):
+
+    home_attack = (
+
+        home_form["avg_scored"] * 0.65
+
+        +
+
+        away_form["avg_conceded"] * 0.35
+
+    )
+
+    away_attack = (
+
+        away_form["avg_scored"] * 0.65
+
+        +
+
+        home_form["avg_conceded"] * 0.35
+
+    )
+
+    # Keep the values realistic.
+
+    home_attack = max(
+
+        0.20,
+
+        min(
+
+            4.00,
+
+            home_attack
+
+        )
+
+    )
+
+    away_attack = max(
+
+        0.20,
+
+        min(
+
+            4.00,
+
+            away_attack
+
+        )
+
+    )
+
+    return (
+
+        round(home_attack, 2),
+
+        round(away_attack, 2)
+
+    )
+
+
+# =========================================================
+# PREMATCH MARKET PROBABILITIES
+# =========================================================
+
+def prematch_market_probabilities(
+
+    home_form,
+
+    away_form
+
+):
+
+    home_attack, away_attack = (
+
+        prematch_goal_expectation(
+
+            home_form,
+
+            away_form
+
+        )
+
+    )
+
+    over25 = poisson_over25(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    under25 = poisson_under25(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    over35 = poisson_over35(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    under35 = poisson_under35(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    btts = poisson_btts(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    # Team goals
+
+    home_over15 = round(
+
+        (
+
+            1 -
+
+            poisson.cdf(
+
+                1,
+
+                home_attack
+
+            )
+
+        ) * 100,
+
+        2
+
+    )
+
+    away_over15 = round(
+
+        (
+
+            1 -
+
+            poisson.cdf(
+
+                1,
+
+                away_attack
+
+            )
+
+        ) * 100,
+
+        2
+
+    )
+
+    return {
+
+        "home_attack": home_attack,
+
+        "away_attack": away_attack,
+
+        "over25": over25,
+
+        "under25": under25,
+
+        "over35": over35,
+
+        "under35": under35,
+
+        "btts": btts,
+
+        "home_over15": home_over15,
+
+        "away_over15": away_over15
+
+    }
+
+
+# =========================================================
+# PREMATCH SIGNAL CANDIDATE
+# =========================================================
+
+def create_prematch_candidate(
+
+    market,
+
+    probability,
+
+    odd,
+
+    confidence
+
+):
+
+    if odd is None:
+
+        return None
+
+    if probability < PREMATCH_MIN_PROBABILITY:
+
+        return None
+
+    if odd < PREMATCH_MIN_ODD:
+
+        return None
+
+    if odd > PREMATCH_MAX_ODD:
+
+        return None
+
+    edge = value_edge(
+
+        probability,
+
+        odd
+
+    )
+
+    ev = (
+
+        probability / 100
+
+        *
+
+        odd
+
+        -
+
+        1
+
+    )
+
+    # Small quality bonus for positive value.
+
+    candidate_confidence = confidence
+
+    if edge >= 15:
+
+        candidate_confidence += 4
+
+    elif edge >= 8:
+
+        candidate_confidence += 2
+
+    elif edge < 0:
+
+        candidate_confidence -= 5
+
+    if ev > 0.15:
+
+        candidate_confidence += 3
+
+    elif ev > 0.05:
+
+        candidate_confidence += 1
+
+    candidate_confidence = min(
+
+        95,
+
+        round(
+
+            candidate_confidence,
+
+            1
+
+        )
+
+    )
+
+    if candidate_confidence < PREMATCH_MIN_CONFIDENCE:
+
+        return None
+
+    # Final score intentionally simple.
+
+    score = (
+
+        probability * 0.45
+
+        +
+
+        candidate_confidence * 0.35
+
+        +
+
+        max(
+
+            0,
+
+            min(
+
+                100,
+
+                50 + edge * 2
+
+            )
+
+        ) * 0.20
+
+    )
+
+    return {
+
+        "market": market,
+
+        "probability": round(
+
+            probability,
+
+            1
+
+        ),
+
+        "odd": round(
+
+            odd,
+
+            2
+
+        ),
+
+        "confidence": candidate_confidence,
+
+        "edge": round(
+
+            edge,
+
+            1
+
+        ),
+
+        "ev": round(
+
+            ev,
+
+            3
+
+        ),
+
+        "score": round(
+
+            score,
+
+            2
+
+        )
+
+    }
+
+
+# =========================================================
+# PREMATCH CONFIDENCE
+# =========================================================
+
+
+
+# =========================================================
+# PREMATCH SIGNAL DEDUPLICATION
+# =========================================================
+
+def deduplicate_prematch_signals(
+
+    candidates
+
+):
+
+    if not candidates:
+
+        return []
+
+    candidates = sorted(
+
+        candidates,
+
+        key=lambda x: (
+
+            x["score"],
+
+            x["probability"],
+
+            x["confidence"],
+
+            x["ev"]
+
+        ),
+
+        reverse=True
+
+    )
+
+    selected = []
+
+    used_direction = set()
+
+    for candidate in candidates:
+
+        market = candidate["market"]
+
+        # Do not send contradictory selections
+        # from the same match.
+
+        if market in (
+
+            "🏆 HOME WIN",
+
+            "✈️ AWAY WIN"
+
+        ):
+
+            direction = "RESULT"
+
+        elif market in (
+
+            "🚀 OVER 2.5",
+
+            "🛡 UNDER 2.5"
+
+        ):
+
+            direction = "TOTAL25"
+
+        elif market in (
+
+            "🔥 OVER 3.5",
+
+            "🛡 UNDER 3.5"
+
+        ):
+
+            direction = "TOTAL35"
+
+        elif market in (
+
+            "💎 BTTS YES",
+
+            "BTTS"
+
+        ):
+
+            direction = "BTTS"
+
+        else:
+
+            direction = market
+
+        if direction in used_direction:
+
+            continue
+
+        used_direction.add(
+
+            direction
+
+        )
+
+        selected.append(
+
+            candidate
+
+        )
+
+    return selected
+
+
+# =========================================================
+# PREMATCH ANALYSIS
+# =========================================================
+
+
+
+# =========================================================
+# PREMATCH SIGNAL DATABASE SAVE
+# =========================================================
+
+def save_prematch_signal(
+
+    signal
+
+):
+
+    if not signal:
+
+        return False
+
+    conn = sqlite3.connect(
+
+        DB_NAME
+
+    )
+
+    cursor = conn.cursor()
+
+    # Prevent duplicate signal for same
+    # fixture + market.
+
+    cursor.execute(
+
+        """
+
+        SELECT id
+
+        FROM signals
+
+        WHERE
+
+            fixture_id=?
+
+            AND market=?
+
+        LIMIT 1
+
+        """,
+
+        (
+
+            signal["fixture_id"],
+
+            signal["market"]
+
+        )
+
+    )
+
+    exists = cursor.fetchone()
+
+    if exists:
+
+        conn.close()
+
+        return False
+
+    cursor.execute(
+
+        """
+
+        INSERT INTO signals(
+
+            fixture_id,
+
+            country,
+
+            league,
+
+            home_team,
+
+            away_team,
+
+            market,
+
+            probability,
+
+            odd,
+
+            confidence,
+
+            result,
+
+            created_at,
+
+            status
+
+        )
+
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+
+        """,
+
+        (
+
+            signal["fixture_id"],
+
+            signal["country"],
+
+            signal["league"],
+
+            signal["home_team"],
+
+            signal["away_team"],
+
+            signal["market"],
+
+            signal["probability"],
+
+            signal["odd"],
+
+            signal["confidence"],
+
+            datetime.now(
+
+                TIMEZONE
+
+            ).isoformat(),
+
+            "PENDING"
+
+        )
+
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return True
+
+
+# =========================================================
+# PREMATCH TELEGRAM MESSAGE
+# =========================================================
+
+
+
+# =========================================================
+# PREMATCH SCAN
+# =========================================================
+
+
+# =========================================================
+# LIVE / NEXT GOAL ENGINE V4
+# =========================================================
+
+LIVE_MINUTE = 45
+LIVE_MAX_MINUTE = 88
+
+LIVE_MIN_PROBABILITY = 68
+LIVE_MIN_CONFIDENCE = 80
+
+LIVE_MIN_PRESSURE = 68
+LIVE_MIN_ATTACK = 65
+
+LIVE_COOLDOWN = 600
+
+MAX_LIVE_SIGNALS_PER_SCAN = 5
+
+
+# =========================================================
+# LIVE STATISTICS HELPERS
+# =========================================================
+
+def get_stat_value(
+
+    statistics,
+
+    team_id,
+
+    stat_name
+
+):
+
+    for team_data in statistics:
+
+        team = team_data.get(
+
+            "team",
+
+            {}
+
+        )
+
+        if team.get("id") != team_id:
+
+            continue
+
+        value = extract(
+
+            team_data,
+
+            stat_name
+
+        )
+
+        return value
+
+    return 0
+
+
+def get_live_team_stats(
+
+    fixture
+
+):
+
+    fixture_id = fixture.get(
+
+        "fixture",
+
+        {}
+
+    ).get(
+
+        "id"
+
+    )
+
+    teams = fixture.get(
+
+        "teams",
+
+        {}
+
+    )
+
+    home = teams.get(
+
+        "home",
+
+        {}
+
+    )
+
+    away = teams.get(
+
+        "away",
+
+        {}
+
+    )
+
+    home_id = home.get(
+
+        "id"
+
+    )
+
+    away_id = away.get(
+
+        "id"
+
+    )
+
+    if not fixture_id:
+
+        return None
+
+    if not home_id or not away_id:
+
+        return None
+
+    statistics = get_statistics(
+
+        fixture_id
+
+    )
+
+    if not statistics:
+
+        return None
+
+    result = {
+
+        "home": {
+
+            "shots": 0,
+
+            "shots_on": 0,
+
+            "dangerous": 0,
+
+            "corners": 0,
+
+            "possession": 0,
+
+            "attacks": 0,
+
+            "xg": 0,
+
+            "red_cards": 0
+
+        },
+
+        "away": {
+
+            "shots": 0,
+
+            "shots_on": 0,
+
+            "dangerous": 0,
+
+            "corners": 0,
+
+            "possession": 0,
+
+            "attacks": 0,
+
+            "xg": 0,
+
+            "red_cards": 0
+
+        }
+
+    }
+
+    for item in statistics:
+
+        team = item.get(
+
+            "team",
+
+            {}
+
+        )
+
+        team_id = team.get(
+
+            "id"
+
+        )
+
+        if team_id == home_id:
+
+            target = result["home"]
+
+        elif team_id == away_id:
+
+            target = result["away"]
+
+        else:
+
+            continue
+
+        for stat in item.get(
+
+            "statistics",
+
+            []
+
+        ):
+
+            name = clean_text(
+
+                stat.get("type")
+
+            )
+
+            value = stat.get(
+
+                "value"
+
+            )
+
+            if value is None:
+
+                continue
+
+            try:
+
+                if isinstance(
+
+                    value,
+
+                    str
+
+                ):
+
+                    value = value.replace(
+
+                        "%",
+
+                        ""
+
+                    )
+
+                value = float(
+
+                    value
+
+                )
+
+            except:
+
+                continue
+
+            if name in (
+
+                "total shots",
+
+                "shots"
+
+            ):
+
+                target["shots"] = value
+
+            elif name in (
+
+                "shots on goal",
+
+                "shots on target"
+
+            ):
+
+                target["shots_on"] = value
+
+            elif name == "dangerous attacks":
+
+                target["dangerous"] = value
+
+            elif name == "corner kicks":
+
+                target["corners"] = value
+
+            elif name == "ball possession":
+
+                target["possession"] = value
+
+            elif name in (
+
+                "attacks",
+
+                "total attacks"
+
+            ):
+
+                target["attacks"] = value
+
+            elif name in (
+
+                "expected goals",
+
+                "xg"
+
+            ):
+
+                target["xg"] = value
+
+            elif name == "red cards":
+
+                target["red_cards"] = value
+
+    return result
+
+
+# =========================================================
+# LIVE PRESSURE
+# =========================================================
+
+
+
+# =========================================================
+# LIVE ATTACK SCORE
+# =========================================================
+
+def calculate_live_attack(
+
+    team
+
+):
+
+    attack = 0
+
+    attack += min(
+
+        30,
+
+        team["dangerous"] * 0.45
+
+    )
+
+    attack += min(
+
+        25,
+
+        team["shots"] * 1.4
+
+    )
+
+    attack += min(
+
+        25,
+
+        team["shots_on"] * 5
+
+    )
+
+    attack += min(
+
+        20,
+
+        team["xg"] * 8
+
+    )
+
+    return round(
+
+        min(
+
+            100,
+
+            attack
+
+        ),
+
+        1
+
+    )
+
+
+# =========================================================
+# LIVE DOMINANCE
+# =========================================================
+
+def live_dominance(
+
+    home,
+
+    away
+
+):
+
+    home_pressure = calculate_live_pressure(
+
+        home
+
+    )
+
+    away_pressure = calculate_live_pressure(
+
+        away
+
+    )
+
+    home_attack = calculate_live_attack(
+
+        home
+
+    )
+
+    away_attack = calculate_live_attack(
+
+        away
+
+    )
+
+    pressure_diff = (
+
+        home_pressure
+
+        -
+
+        away_pressure
+
+    )
+
+    attack_diff = (
+
+        home_attack
+
+        -
+
+        away_attack
+
+    )
+
+    return {
+
+        "home_pressure": home_pressure,
+
+        "away_pressure": away_pressure,
+
+        "home_attack": home_attack,
+
+        "away_attack": away_attack,
+
+        "pressure_diff": round(
+
+            pressure_diff,
+
+            1
+
+        ),
+
+        "attack_diff": round(
+
+            attack_diff,
+
+            1
+
+        )
+
+    }
+
+
+# =========================================================
+# LIVE GOAL BASE PROBABILITY
+# =========================================================
+
+
+
+# =========================================================
+# LIVE CONFIDENCE
+# =========================================================
+
+def live_confidence(
+
+    probability,
+
+    pressure,
+
+    attack,
+
+    shots_on,
+
+    xg,
+
+    score_diff,
+
+    minute
+
+):
+
+    confidence = 50
+
+    # Probability
+
+    if probability >= 85:
+
+        confidence += 15
+
+    elif probability >= 78:
+
+        confidence += 11
+
+    elif probability >= 72:
+
+        confidence += 7
+
+    elif probability >= 68:
+
+        confidence += 4
+
+    # Pressure
+
+    if pressure >= 90:
+
+        confidence += 10
+
+    elif pressure >= 80:
+
+        confidence += 7
+
+    elif pressure >= 70:
+
+        confidence += 4
+
+    # Attack
+
+    if attack >= 90:
+
+        confidence += 8
+
+    elif attack >= 80:
+
+        confidence += 5
+
+    elif attack >= 70:
+
+        confidence += 3
+
+    # Shots on target
+
+    if shots_on >= 6:
+
+        confidence += 6
+
+    elif shots_on >= 4:
+
+        confidence += 4
+
+    elif shots_on >= 2:
+
+        confidence += 2
+
+    # xG
+
+    if xg >= 2.5:
+
+        confidence += 7
+
+    elif xg >= 1.8:
+
+        confidence += 4
+
+    elif xg >= 1.2:
+
+        confidence += 2
+
+    # Close match
+
+    if score_diff <= 1:
+
+        confidence += 4
+
+    # Best live period
+
+    if 55 <= minute <= 80:
+
+        confidence += 4
+
+    return round(
+
+        min(
+
+            95,
+
+            confidence
+
+        ),
+
+        1
+
+    )
+
+
+# =========================================================
+# LIVE SIDE SELECTION
+# =========================================================
+
+def select_next_goal_side(
+
+    home,
+
+    away,
+
+    dominance
+
+):
+
+    home_score = (
+
+        dominance["home_pressure"] * 0.45
+
+        +
+
+        dominance["home_attack"] * 0.55
+
+    )
+
+    away_score = (
+
+        dominance["away_pressure"] * 0.45
+
+        +
+
+        dominance["away_attack"] * 0.55
+
+    )
+
+    # Need clear separation.
+    # This is important for quality.
+
+    if abs(
+
+        home_score - away_score
+
+    ) < 10:
+
+        return None
+
+    if home_score > away_score:
+
+        return {
+
+            "side": "HOME",
+
+            "score": round(
+
+                home_score,
+
+                1
+
+            ),
+
+            "opponent_score": round(
+
+                away_score,
+
+                1
+
+            )
+
+        }
+
+    return {
+
+        "side": "AWAY",
+
+        "score": round(
+
+            away_score,
+
+            1
+
+        ),
+
+        "opponent_score": round(
+
+            home_score,
+
+            1
+
+        )
+
+    }
+
+
+# =========================================================
+# LIVE SIGNAL QUALITY
+# =========================================================
+
+def live_signal_quality(
+
+    pressure,
+
+    attack,
+
+    probability,
+
+    confidence,
+
+    shots_on,
+
+    xg,
+
+    pressure_diff
+
+):
+
+    quality = 0
+
+    quality += probability * 0.30
+
+    quality += confidence * 0.30
+
+    quality += pressure * 0.15
+
+    quality += attack * 0.15
+
+    quality += min(
+
+        10,
+
+        shots_on * 1.5
+
+    )
+
+    quality += min(
+
+        8,
+
+        xg * 2
+
+    )
+
+    if pressure_diff >= 20:
+
+        quality += 5
+
+    elif pressure_diff >= 12:
+
+        quality += 3
+
+    return round(
+
+        min(
+
+            100,
+
+            quality
+
+        ),
+
+        2
+
+    )
+
+
+# =========================================================
+# LIVE RISK
+# =========================================================
+
+def live_risk(
+
+    probability,
+
+    confidence,
+
+    pressure_diff,
+
+    minute,
+
+    score_diff,
+
+    red_cards
+
+):
+
+    risk = 0
+
+    if probability < 70:
+
+        risk += 20
+
+    elif probability < 75:
+
+        risk += 10
+
+    if confidence < 80:
+
+        risk += 15
+
+    elif confidence < 85:
+
+        risk += 7
+
+    if pressure_diff < 10:
+
+        risk += 15
+
+    if minute < 50:
+
+        risk += 15
+
+    if minute >= 86:
+
+        risk += 8
+
+    if score_diff >= 2:
+
+        risk += 8
+
+    if red_cards > 0:
+
+        risk += 5
+
+    return min(
+
+        100,
+
+        risk
+
+    )
+
+
+# =========================================================
+# LIVE FINAL DECISION
+# =========================================================
+
+
+
+# =========================================================
+# LIVE SIGNAL SAVE
+# =========================================================
+
+def save_live_signal(
+
+    signal
+
+):
+
+    if not signal:
+
+        return False
+
+    conn = sqlite3.connect(
+
+        DB_NAME
+
+    )
+
+    cursor = conn.cursor()
+
+    # Same fixture + market + score
+    # should not be duplicated.
+
+    cursor.execute(
+
+        """
+
+        SELECT id
+
+        FROM signals
+
+        WHERE
+
+            fixture_id=?
+
+            AND market=?
+
+            AND home_goals=?
+
+            AND away_goals=?
+
+        LIMIT 1
+
+        """,
+
+        (
+
+            signal["fixture_id"],
+
+            signal["market"],
+
+            signal["home_goals"],
+
+            signal["away_goals"]
+
+        )
+
+    )
+
+    if cursor.fetchone():
+
+        conn.close()
+
+        return False
+
+    cursor.execute(
+
+        """
+
+        INSERT INTO signals(
+
+            fixture_id,
+
+            country,
+
+            league,
+
+            home_team,
+
+            away_team,
+
+            market,
+
+            probability,
+
+            odd,
+
+            confidence,
+
+            result,
+
+            created_at,
+
+            status,
+
+            home_goals,
+
+            away_goals,
+
+            fixture_status
+
+        )
+
+        VALUES(
+
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+
+            NULL, ?, 'PENDING', ?, ?, 'LIVE'
+
+        )
+
+        """,
+
+        (
+
+            signal["fixture_id"],
+
+            signal["country"],
+
+            signal["league"],
+
+            signal["home_team"],
+
+            signal["away_team"],
+
+            signal["market"],
+
+            signal["probability"],
+
+            None,
+
+            signal["confidence"],
+
+            signal["created_at"],
+
+            signal["home_goals"],
+
+            signal["away_goals"]
+
+        )
+
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return True
+
+
+# =========================================================
+# LIVE TELEGRAM
+# =========================================================
+
+
+
+# =========================================================
+# LIVE SCANNER
+# =========================================================
+
+
+# =========================================================
+# MAIN ENGINE V4
+# =========================================================
+#
+# Един централен engine:
+#
+# PREMATCH
+#    ↓
+# LIVE
+#    ↓
+# SIGNAL FILTER
+#    ↓
+# SAVE
+#    ↓
+# TELEGRAM
+#    ↓
+# RESULT CHECK
+#
+# =========================================================
+
+import time
+import logging
+import sqlite3
+from datetime import datetime
+
+
+# =========================================================
+# MAIN SETTINGS
+# =========================================================
+
+SCAN_INTERVAL = 60
+
+PREMATCH_SCAN_INTERVAL = 300
+
+LIVE_SCAN_INTERVAL = 60
+
+RESULT_SCAN_INTERVAL = 120
+
+MAX_PREMATCH_SIGNALS = 5
+
+MAX_LIVE_SIGNALS = 5
+
+MIN_PREMATCH_CONFIDENCE = 75
+
+MIN_LIVE_CONFIDENCE = 80
+
+MIN_LIVE_PROBABILITY = 68
+
+MAX_LIVE_RISK = 35
+
+
+# =========================================================
+# RUNTIME STATE
+# =========================================================
+
+LAST_PREMATCH_SCAN = 0
+
+LAST_LIVE_SCAN = 0
+
+LAST_RESULT_SCAN = 0
+
+RUNNING = True
+
+
+# =========================================================
+# GLOBAL SIGNAL MEMORY
+# =========================================================
+
+SENT_SIGNALS = {}
+
+sent_live = {}
+
+sent_prematch = {}
+
+
+# =========================================================
+# SAFE LOGGING
+# =========================================================
+
+def main_log(
+
+    message,
+
+    level="INFO"
+
+):
+
+    try:
+
+        if level == "ERROR":
+
+            logging.error(
+
+                message
+
+            )
+
+        elif level == "WARNING":
+
+            logging.warning(
+
+                message
+
+            )
+
+        else:
+
+            logging.info(
+
+                message
+
+            )
+
+    except Exception:
+
+        print(
+
+            message
+
+        )
+
+
+# =========================================================
+# SAFE TIME
+# =========================================================
+
+def now_ts():
+
+    return time.time()
+
+
+# =========================================================
+# SAFE SIGNAL KEY
+# =========================================================
+
+def make_signal_key(
+
+    fixture_id,
+
+    market
+
+):
+
+    return (
+
+        f"{fixture_id}_"
+
+        f"{market}"
+
+    )
+
+
+# =========================================================
+# SIGNAL DUPLICATE CHECK
+# =========================================================
+
+def already_sent(
+
+    fixture_id,
+
+    market,
+
+    cooldown=900
+
+):
+
+    key = make_signal_key(
+
+        fixture_id,
+
+        market
+
+    )
+
+    now = now_ts()
+
+    if key not in SENT_SIGNALS:
+
+        return False
+
+    elapsed = (
+
+        now
+
+        -
+
+        SENT_SIGNALS[key]
+
+    )
+
+    if elapsed < cooldown:
+
+        return True
+
+    return False
+
+
+# =========================================================
+# MARK SIGNAL AS SENT
+# =========================================================
+
+def mark_signal_sent(
+
+    fixture_id,
+
+    market
+
+):
+
+    key = make_signal_key(
+
+        fixture_id,
+
+        market
+
+    )
+
+    SENT_SIGNALS[key] = now_ts()
+
+
+# =========================================================
+# SAFE TELEGRAM SEND
+# =========================================================
+
+def safe_send_telegram(
+
+    message
+
+):
+
+    try:
+
+        result = send_telegram(
+
+            message
+
+        )
+
+        return bool(
+
+            result
+
+        )
+
+    except Exception as e:
+
+        main_log(
+
+            f"Telegram error: {repr(e)}",
+
+            "WARNING"
+
+        )
+
+        return False
+
+
+# =========================================================
+# PREMATCH SIGNAL NORMALIZER
+# =========================================================
+
+
+
+# =========================================================
+# PREMATCH MESSAGE
+# =========================================================
+
+
+
+# =========================================================
+# PREMATCH SCANNER
+# =========================================================
+
+
+
+# =========================================================
+# LIVE SCANNER WRAPPER
+# =========================================================
+
+def run_live_scan():
+
+    try:
+
+        signals = scan_live_matches()
+
+        if signals:
+
+            main_log(
+
+                f"LIVE signals sent: "
+
+                f"{len(signals)}"
+
+            )
+
+        return signals
+
+    except Exception as e:
+
+        main_log(
+
+            f"Live scanner error: {repr(e)}",
+
+            "WARNING"
+
+        )
+
+        return []
+
+
+# =========================================================
+# RESULT CHECKER WRAPPER
+# =========================================================
+
+def run_result_checker():
+
+    try:
+
+        # Use existing result checker
+        # if it exists in the project.
+
+        checker = globals().get(
+
+            "check_results"
+
+        )
+
+        if checker is None:
+
+            return []
+
+        result = checker()
+
+        return result
+
+    except Exception as e:
+
+        main_log(
+
+            f"Result checker error: "
+
+            f"{repr(e)}",
+
+            "WARNING"
+
+        )
+
+        return []
+
+
+# =========================================================
+# DATABASE HEALTH CHECK
+# =========================================================
+
+def database_health_check():
+
+    try:
+
+        conn = sqlite3.connect(
+
+            DB_NAME
+
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+
+            """
+
+            SELECT COUNT(*)
+
+            FROM signals
+
+            """
+
+        )
+
+        total = cursor.fetchone()[0]
+
+        conn.close()
+
+        return total
+
+    except Exception as e:
+
+        main_log(
+
+            f"Database error: {repr(e)}",
+
+            "ERROR"
+
+        )
+
+        return None
+
+
+# =========================================================
+# API HEALTH CHECK
+# =========================================================
+
+
+
+# =========================================================
+# SYSTEM STATUS
+# =========================================================
+
+
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+
+
+# =========================================================
+# STARTUP
+# =========================================================
+
+
+
+# =========================================================
+# PROGRAM ENTRY POINT
+# =========================================================
+
+if __name__ == "__main__":
+
+    startup()
+
+# =========================================================
+# PREMATCH ENGINE V4
+# =========================================================
+
+
+# =========================================================
+# PREMATCH FIXTURE ENGINE V4
+# =========================================================
+
+
+
+# =========================================================
+# PREMATCH MATCH INFO
+# =========================================================
+
+def prematch_match_info(match):
+
+    try:
+
+        fixture = match.get(
+
+            "fixture",
+
+            {}
+        )
+
+        teams = match.get(
+
+            "teams",
+
+            {}
+        )
+
+        league = match.get(
+
+            "league",
+
+            {}
+        )
+
+        date_text = fixture.get(
+
+            "date"
+        )
+
+        match_time = None
+
+        if date_text:
+
+            try:
+
+                dt = datetime.fromisoformat(
+
+                    date_text.replace(
+
+                        "Z",
+
+                        "+00:00"
+
+                    )
+
+                )
+
+                match_time = dt.astimezone(
+
+                    TIMEZONE
+
+                ).strftime(
+
+                    "%d.%m.%Y %H:%M"
+
+                )
+
+            except Exception:
+
+                pass
+
+        return {
+
+            "fixture_id":
+
+                fixture.get("id"),
+
+            "home":
+
+                teams.get(
+
+                    "home",
+
+                    {}
+
+                ).get(
+
+                    "name",
+
+                    ""
+
+                ),
+
+            "away":
+
+                teams.get(
+
+                    "away",
+
+                    {}
+
+                ).get(
+
+                    "name",
+
+                    ""
+
+                ),
+
+            "league":
+
+                league.get(
+
+                    "name",
+
+                    ""
+
+                ),
+
+            "country":
+
+                league.get(
+
+                    "country",
+
+                    ""
+
+                ),
+
+            "time":
+
+                match_time
+
+        }
+
+    except Exception:
+
+        return None
+
+# =========================================================
+# LIVE ENGINE V4
+# =========================================================
+
+LIVE_MINUTE = 25
+
+LIVE_MAX_MINUTE = 88
+
+LIVE_MIN_PROBABILITY = 68
+
+LIVE_MIN_CONFIDENCE = 78
+
+LIVE_MAX_RISK = 35
+
+LIVE_MAX_SIGNALS = 5
+
+
+# =========================================================
+# LIVE STATISTICS PARSER
+# =========================================================
+
+
+
+# =========================================================
+# STAT HELPER
+# =========================================================
+
+
+
+# =========================================================
+# LIVE PRESSURE
+# =========================================================
+
+def calculate_live_pressure(
+
+    stats
+
+):
+
+    shots = live_stat(
+
+        stats,
+
+        "Total Shots"
+
+    )
+
+    shots_on = live_stat(
+
+        stats,
+
+        "Shots on Goal",
+
+        "Shots on Target"
+
+    )
+
+    corners = live_stat(
+
+        stats,
+
+        "Corner Kicks"
+
+    )
+
+    dangerous = live_stat(
+
+        stats,
+
+        "Dangerous Attacks"
+
+    )
+
+    possession = live_stat(
+
+        stats,
+
+        "Ball Possession"
+
+    )
+
+    pressure = 0
+
+    pressure += min(
+
+        25,
+
+        shots * 2
+
+    )
+
+    pressure += min(
+
+        25,
+
+        shots_on * 5
+
+    )
+
+    pressure += min(
+
+        15,
+
+        corners * 2
+
+    )
+
+    pressure += min(
+
+        25,
+
+        dangerous * 0.35
+
+    )
+
+    pressure += min(
+
+        10,
+
+        max(
+
+            0,
+
+            possession - 50
+
+        ) * 0.20
+
+    )
+
+    return round(
+
+        min(
+
+            100,
+
+            pressure
+
+        ),
+
+        1
+
+    )
+
+
+# =========================================================
+# LIVE ATTACK SCORE
+# =========================================================
+
+def calculate_attack(
+
+    stats
+
+):
+
+    shots = live_stat(
+
+        stats,
+
+        "Total Shots"
+
+    )
+
+    shots_on = live_stat(
+
+        stats,
+
+        "Shots on Goal",
+
+        "Shots on Target"
+
+    )
+
+    dangerous = live_stat(
+
+        stats,
+
+        "Dangerous Attacks"
+
+    )
+
+    corners = live_stat(
+
+        stats,
+
+        "Corner Kicks"
+
+    )
+
+    attack = 0
+
+    attack += min(
+
+        30,
+
+        shots * 2.5
+
+    )
+
+    attack += min(
+
+        30,
+
+        shots_on * 7
+
+    )
+
+    attack += min(
+
+        25,
+
+        dangerous * 0.40
+
+    )
+
+    attack += min(
+
+        15,
+
+        corners * 2
+
+    )
+
+    return round(
+
+        min(
+
+            100,
+
+            attack
+
+        ),
+
+        1
+
+    )
+
+
+# =========================================================
+# LIVE xG
+# =========================================================
+
+def get_live_xg(
+
+    stats
+
+):
+
+    xg = live_stat(
+
+        stats,
+
+        "Expected Goals",
+
+        "xG"
+
+    )
+
+    return max(
+
+        0,
+
+        xg
+
+    )
+
+
+# =========================================================
+# LIVE MATCH ANALYSIS
+# =========================================================
+
+
+
+# =========================================================
+# LIVE SIGNAL MESSAGE
+# =========================================================
+
+
+
+# =========================================================
+# LIVE SCANNER
+# =========================================================
+
+
+# =========================================================
+# PREMATCH CORE V4
+# =========================================================
+
+PREMATCH_MIN_PROBABILITY = 62
+
+PREMATCH_MIN_CONFIDENCE = 75
+
+PREMATCH_MAX_RISK = 40
+
+PREMATCH_MAX_SIGNALS = 5
+
+
+# =========================================================
+# PREMATCH MARKET PROBABILITY
+# =========================================================
+
+def prematch_market_probability(
+
+    home_form,
+
+    away_form,
+
+    table_home=None,
+
+    table_away=None
+
+):
+
+    home_strength = team_strength(
+
+        home_form
+
+    )
+
+    away_strength = team_strength(
+
+        away_form
+
+    )
+
+    # =====================================================
+    # TABLE ADVANTAGE
+    # =====================================================
+
+    if table_home and table_away:
+
+        home_strength += (
+
+            table_away["rank"]
+
+            -
+
+            table_home["rank"]
+
+        ) * 1.5
+
+        away_strength += (
+
+            table_home["rank"]
+
+            -
+
+            table_away["rank"]
+
+        ) * 1.5
+
+        home_strength += (
+
+            table_home["goal_diff"]
+
+            -
+
+            table_away["goal_diff"]
+
+        ) * 0.25
+
+        away_strength += (
+
+            table_away["goal_diff"]
+
+            -
+
+            table_home["goal_diff"]
+
+        ) * 0.25
+
+    home_strength = max(
+
+        1,
+
+        home_strength
+
+    )
+
+    away_strength = max(
+
+        1,
+
+        away_strength
+
+    )
+
+    total_strength = (
+
+        home_strength
+
+        +
+
+        away_strength
+
+    )
+
+    home_probability = round(
+
+        home_strength
+
+        /
+
+        total_strength
+
+        *
+
+        100,
+
+        1
+
+    )
+
+    away_probability = round(
+
+        away_strength
+
+        /
+
+        total_strength
+
+        *
+
+        100,
+
+        1
+
+    )
+
+    return {
+
+        "home_strength":
+
+            round(
+
+                home_strength,
+
+                2
+
+            ),
+
+        "away_strength":
+
+            round(
+
+                away_strength,
+
+                2
+
+            ),
+
+        "home_probability":
+
+            home_probability,
+
+        "away_probability":
+
+            away_probability
+
+    }
+
+
+# =========================================================
+# PREMATCH GOALS MODEL
+# =========================================================
+
+def prematch_goal_model(
+
+    home_form,
+
+    away_form
+
+):
+
+    home_attack = (
+
+        home_form["avg_scored"]
+
+        *
+
+        0.60
+
+        +
+
+        away_form["avg_conceded"]
+
+        *
+
+        0.40
+
+    )
+
+    away_attack = (
+
+        away_form["avg_scored"]
+
+        *
+
+        0.60
+
+        +
+
+        home_form["avg_conceded"]
+
+        *
+
+        0.40
+
+    )
+
+    home_attack = max(
+
+        0.10,
+
+        min(
+
+            4.00,
+
+            home_attack
+
+        )
+
+    )
+
+    away_attack = max(
+
+        0.10,
+
+        min(
+
+            4.00,
+
+            away_attack
+
+        )
+
+    )
+
+    over25 = poisson_over25(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    over35 = poisson_over35(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    under25 = poisson_under25(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    under35 = poisson_under35(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    btts = poisson_btts(
+
+        home_attack,
+
+        away_attack
+
+    )
+
+    return {
+
+        "home_attack":
+
+            round(
+
+                home_attack,
+
+                2
+
+            ),
+
+        "away_attack":
+
+            round(
+
+                away_attack,
+
+                2
+
+            ),
+
+        "over25":
+
+            over25,
+
+        "over35":
+
+            over35,
+
+        "under25":
+
+            under25,
+
+        "under35":
+
+            under35,
+
+        "btts":
+
+            btts
+
+    }
+
+
+# =========================================================
+# PREMATCH CONFIDENCE
+# =========================================================
+
+def prematch_confidence(
+
+    probability,
+
+    form,
+
+    opponent_form,
+
+    market,
+
+    league_score=50
+
+):
+
+    confidence = 50
+
+    # =====================================================
+    # PROBABILITY
+    # =====================================================
+
+    confidence += (
+
+        probability
+
+        -
+
+        60
+
+    ) * 0.45
+
+    # =====================================================
+    # TEAM FORM
+    # =====================================================
+
+    confidence += (
+
+        form["recent_form_pct"]
+
+        -
+
+        60
+
+    ) * 0.12
+
+    # =====================================================
+    # FORM DIFFERENCE
+    # =====================================================
+
+    form_difference = (
+
+        form["form_pct"]
+
+        -
+
+        opponent_form["form_pct"]
+
+    )
+
+    if abs(form_difference) >= 15:
+
+        confidence += 4
+
+    elif abs(form_difference) >= 8:
+
+        confidence += 2
+
+    # =====================================================
+    # MARKET SUPPORT
+    # =====================================================
+
+    if market in (
+
+        "🚀 OVER 2.5",
+
+        "💎 BTTS YES"
+
+    ):
+
+        if league_score >= 75:
+
+            confidence += 4
+
+        elif league_score <= 55:
+
+            confidence -= 4
+
+    # =====================================================
+    # STRONG RECENT FORM
+    # =====================================================
+
+    if form["recent_form_pct"] >= 75:
+
+        confidence += 3
+
+    # =====================================================
+    # CONSISTENT SCORING
+    # =====================================================
+
+    if form["scored_pct"] >= 80:
+
+        confidence += 2
+
+    return round(
+
+        min(
+
+            95,
+
+            max(
+
+                0,
+
+                confidence
+
+            )
+
+        ),
+
+        1
+
+    )
+
+
+# =========================================================
+# PREMATCH RISK
+# =========================================================
+
+def prematch_risk(
+
+    probability,
+
+    confidence,
+
+    form,
+
+    opponent_form
+
+):
+
+    risk = 0
+
+    # =====================================================
+    # LOW PROBABILITY
+    # =====================================================
+
+    if probability < 65:
+
+        risk += 15
+
+    elif probability < 70:
+
+        risk += 8
+
+    # =====================================================
+    # CONFIDENCE
+    # =====================================================
+
+    if confidence < 75:
+
+        risk += 15
+
+    elif confidence < 80:
+
+        risk += 8
+
+    # =====================================================
+    # CLOSE TEAMS
+    # =====================================================
+
+    form_difference = abs(
+
+        form["form_pct"]
+
+        -
+
+        opponent_form["form_pct"]
+
+    )
+
+    if form_difference < 5:
+
+        risk += 10
+
+    # =====================================================
+    # WEAK SCORING
+    # =====================================================
+
+    if form["scored_pct"] < 60:
+
+        risk += 8
+
+    return min(
+
+        100,
+
+        risk
+
+    )
+
+
+# =========================================================
+# PREMATCH SIGNAL
+# =========================================================
+
+def create_prematch_signal(
+
+    market,
+
+    probability,
+
+    confidence,
+
+    risk,
+
+    odd,
+
+    home,
+
+    away,
+
+    league
+
+):
+
+    if odd is None:
+
+        return None
+
+    if probability < PREMATCH_MIN_PROBABILITY:
+
+        return None
+
+    if confidence < PREMATCH_MIN_CONFIDENCE:
+
+        return None
+
+    if risk > PREMATCH_MAX_RISK:
+
+        return None
+
+    # =====================================================
+    # VALUE
+    # =====================================================
+
+    edge = value_edge(
+
+        probability,
+
+        odd
+
+    )
+
+    # Don't require huge value.
+    # We want quality first.
+
+    if edge < -2:
+
+        return None
+
+    return {
+
+        "market":
+
+            market,
+
+        "probability":
+
+            round(
+
+                probability,
+
+                1
+
+            ),
+
+        "confidence":
+
+            round(
+
+                confidence,
+
+                1
+
+            ),
+
+        "risk":
+
+            risk,
+
+        "odd":
+
+            odd,
+
+        "edge":
+
+            edge,
+
+        "home_team":
+
+            home,
+
+        "away_team":
+
+            away,
+
+        "league":
+
+            league
+
+    }
+
+
+# =========================================================
+# PREMATCH ANALYZER V4
+# =========================================================
+
+def analyze_prematch(
+
+    match
+
+):
+
+    try:
+
+        fixture = match.get(
+
+            "fixture",
+
+            {}
+
+        )
+
+        teams = match.get(
+
+            "teams",
+
+            {}
+
+        )
+
+        league = match.get(
+
+            "league",
+
+            {}
+
+        )
+
+        fixture_id = fixture.get(
+
+            "id"
+
+        )
+
+        if not fixture_id:
+
+            return []
+
+        home_team = teams.get(
+
+            "home",
+
+            {}
+
+        )
+
+        away_team = teams.get(
+
+            "away",
+
+            {}
+
+        )
+
+        home_id = home_team.get(
+
+            "id"
+
+        )
+
+        away_id = away_team.get(
+
+            "id"
+
+        )
+
+        home_name = home_team.get(
+
+            "name",
+
+            "HOME"
+
+        )
+
+        away_name = away_team.get(
+
+            "name",
+
+            "AWAY"
+
+        )
+
+        league_id = league.get(
+
+            "id"
+
+        )
+
+        league_name = league.get(
+
+            "name",
+
+            ""
+
+        )
+
+        country = league.get(
+
+            "country",
+
+            ""
+
+        )
+
+        season = league.get(
+
+            "season"
+
+        )
+
+        if not home_id or not away_id:
+
+            return []
+
+        # =================================================
+        # BASIC FILTER
+        # =================================================
+
+        if blocked_league(
+
+            league_name
+
+        ):
+
+            return []
+
+        if country in BAD_COUNTRIES:
+
+            return []
+
+        # =================================================
+        # FORM
+        # =================================================
+
+        home_form = get_team_form(
+
+            home_id,
+
+            "home"
+
+        )
+
+        away_form = get_team_form(
+
+            away_id,
+
+            "away"
+
+        )
+
+        if not home_form or not away_form:
+
+            return []
+
+        # =================================================
+        # TABLE
+        # =================================================
+
+        table = get_league_table(
+
+            league_id,
+
+            season
+
+        )
+
+        table_home = table.get(
+
+            home_id
+
+        )
+
+        table_away = table.get(
+
+            away_id
+
+        )
+
+        # =================================================
+        # ODDS
+        # =================================================
+
+        match_odds = get_match_odds(
+
+            fixture_id
+
+        )
+
+        if match_odds is None:
+
+            return []
+
+        (
+
+            home_odd,
+
+            draw_odd,
+
+            away_odd,
+
+            over25_odd,
+
+            under25_odd,
+
+            over35_odd,
+
+            under35_odd,
+
+            btts_odd,
+
+            home15_odd,
+
+            away15_odd
+
+        ) = match_odds
+
+        # =================================================
+        # STRENGTH
+        # =================================================
+
+        strength = prematch_market_probability(
+
+            home_form,
+
+            away_form,
+
+            table_home,
+
+            table_away
+
+        )
+
+        home_probability = strength[
+
+            "home_probability"
+
+        ]
+
+        away_probability = strength[
+
+            "away_probability"
+
+        ]
+
+        # =================================================
+        # GOALS
+        # =================================================
+
+        goals = prematch_goal_model(
+
+            home_form,
+
+            away_form
+
+        )
+
+        # =================================================
+        # LEAGUE SCORE
+        # =================================================
+
+        league_avg_goals = (
+
+            (
+
+                home_form["avg_scored"]
+
+                +
+
+                home_form["avg_conceded"]
+
+                +
+
+                away_form["avg_scored"]
+
+                +
+
+                away_form["avg_conceded"]
+
+            )
+
+            /
+
+            2
+
+        )
+
+        league_btts = (
+
+            (
+
+                home_form["btts_pct"]
+
+                +
+
+                away_form["btts_pct"]
+
+            )
+
+            /
+
+            2
+
+        )
+
+        league_over25 = (
+
+            (
+
+                home_form["over25_pct"]
+
+                +
+
+                away_form["over25_pct"]
+
+            )
+
+            /
+
+            2
+
+        )
+
+        league_score = league_ai_score(
+
+            league_name,
+
+            country,
+
+            league_avg_goals,
+
+            league_btts,
+
+            league_over25
+
+        )
+
+        signals = []
+
+        # =================================================
+        # HOME WIN
+        # =================================================
+
+        if (
+
+            home_odd is not None
+
+            and
+
+            home_probability >=
+
+            PREMATCH_MIN_PROBABILITY
+
+        ):
+
+            confidence = prematch_confidence(
+
+                home_probability,
+
+                home_form,
+
+                away_form,
+
+                "🏆 HOME WIN",
+
+                league_score
+
+            )
+
+            risk = prematch_risk(
+
+                home_probability,
+
+                confidence,
+
+                home_form,
+
+                away_form
+
+            )
+
+            signal = create_prematch_signal(
+
+                "🏆 HOME WIN",
+
+                home_probability,
+
+                confidence,
+
+                risk,
+
+                home_odd,
+
+                home_name,
+
+                away_name,
+
+                league_name
+
+            )
+
+            if signal:
+
+                signals.append(
+
+                    signal
+
+                )
+
+        # =================================================
+        # AWAY WIN
+        # =================================================
+
+        if (
+
+            away_odd is not None
+
+            and
+
+            away_probability >=
+
+            PREMATCH_MIN_PROBABILITY
+
+        ):
+
+            confidence = prematch_confidence(
+
+                away_probability,
+
+                away_form,
+
+                home_form,
+
+                "✈️ AWAY WIN",
+
+                league_score
+
+            )
+
+            risk = prematch_risk(
+
+                away_probability,
+
+                confidence,
+
+                away_form,
+
+                home_form
+
+            )
+
+            signal = create_prematch_signal(
+
+                "✈️ AWAY WIN",
+
+                away_probability,
+
+                confidence,
+
+                risk,
+
+                away_odd,
+
+                home_name,
+
+                away_name,
+
+                league_name
+
+            )
+
+            if signal:
+
+                signals.append(
+
+                    signal
+
+                )
+
+        # =================================================
+        # OVER 2.5
+        # =================================================
+
+        if over25_odd is not None:
+
+            probability = goals[
+
+                "over25"
+
+            ]
+
+            confidence = prematch_confidence(
+
+                probability,
+
+                home_form,
+
+                away_form,
+
+                "🚀 OVER 2.5",
+
+                league_score
+
+            )
+
+            risk = prematch_risk(
+
+                probability,
+
+                confidence,
+
+                home_form,
+
+                away_form
+
+            )
+
+            signal = create_prematch_signal(
+
+                "🚀 OVER 2.5",
+
+                probability,
+
+                confidence,
+
+                risk,
+
+                over25_odd,
+
+                home_name,
+
+                away_name,
+
+                league_name
+
+            )
+
+            if signal:
+
+                signals.append(
+
+                    signal
+
+                )
+
+        # =================================================
+        # UNDER 2.5
+        # =================================================
+
+        if under25_odd is not None:
+
+            probability = goals[
+
+                "under25"
+
+            ]
+
+            confidence = prematch_confidence(
+
+                probability,
+
+                away_form,
+
+                home_form,
+
+                "🛡 UNDER 2.5",
+
+                league_score
+
+            )
+
+            risk = prematch_risk(
+
+                probability,
+
+                confidence,
+
+                away_form,
+
+                home_form
+
+            )
+
+            signal = create_prematch_signal(
+
+                "🛡 UNDER 2.5",
+
+                probability,
+
+                confidence,
+
+                risk,
+
+                under25_odd,
+
+                home_name,
+
+                away_name,
+
+                league_name
+
+            )
+
+            if signal:
+
+                signals.append(
+
+                    signal
+
+                )
+
+        # =================================================
+        # BTTS
+        # =================================================
+
+        if btts_odd is not None:
+
+            probability = goals[
+
+                "btts"
+
+            ]
+
+            confidence = prematch_confidence(
+
+                probability,
+
+                home_form,
+
+                away_form,
+
+                "💎 BTTS YES",
+
+                league_score
+
+            )
+
+            risk = prematch_risk(
+
+                probability,
+
+                confidence,
+
+                home_form,
+
+                away_form
+
+            )
+
+            signal = create_prematch_signal(
+
+                "💎 BTTS YES",
+
+                probability,
+
+                confidence,
+
+                risk,
+
+                btts_odd,
+
+                home_name,
+
+                away_name,
+
+                league_name
+
+            )
+
+            if signal:
+
+                signals.append(
+
+                    signal
+
+                )
+
+        # =================================================
+        # HOME OVER 1.5
+        # =================================================
+
+        if home15_odd is not None:
+
+            probability = round(
+
+                min(
+
+                    92,
+
+                    50
+
+                    +
+
+                    home_form["avg_scored"]
+
+                    * 15
+
+                    +
+
+                    (
+
+                        home_form["scored_pct"]
+
+                        -
+
+                        60
+
+                    )
+
+                    * 0.20
+
+                ),
+
+                1
+
+            )
+
+            confidence = prematch_confidence(
+
+                probability,
+
+                home_form,
+
+                away_form,
+
+                "⚽ HOME OVER 1.5",
+
+                league_score
+
+            )
+
+            risk = prematch_risk(
+
+                probability,
+
+                confidence,
+
+                home_form,
+
+                away_form
+
+            )
+
+            signal = create_prematch_signal(
+
+                "⚽ HOME OVER 1.5",
+
+                probability,
+
+                confidence,
+
+                risk,
+
+                home15_odd,
+
+                home_name,
+
+                away_name,
+
+                league_name
+
+            )
+
+            if signal:
+
+                signals.append(
+
+                    signal
+
+                )
+
+        # =================================================
+        # AWAY OVER 1.5
+        # =================================================
+
+        if away15_odd is not None:
+
+            probability = round(
+
+                min(
+
+                    92,
+
+                    50
+
+                    +
+
+                    away_form["avg_scored"]
+
+                    * 15
+
+                    +
+
+                    (
+
+                        away_form["scored_pct"]
+
+                        -
+
+                        60
+
+                    )
+
+                    * 0.20
+
+                ),
+
+                1
+
+            )
+
+            confidence = prematch_confidence(
+
+                probability,
+
+                away_form,
+
+                home_form,
+
+                "⚽ AWAY OVER 1.5",
+
+                league_score
+
+            )
+
+            risk = prematch_risk(
+
+                probability,
+
+                confidence,
+
+                away_form,
+
+                home_form
+
+            )
+
+            signal = create_prematch_signal(
+
+                "⚽ AWAY OVER 1.5",
+
+                probability,
+
+                confidence,
+
+                risk,
+
+                away15_odd,
+
+                home_name,
+
+                away_name,
+
+                league_name
+
+            )
+
+            if signal:
+
+                signals.append(
+
+                    signal
+
+                )
+
+        # =================================================
+        # SORT
+        # =================================================
+
+        signals.sort(
+
+            key=lambda x: (
+
+                x["confidence"],
+
+                x["probability"],
+
+                x["edge"],
+
+                -x["risk"]
+
+            ),
+
+            reverse=True
+
+        )
+
+        return signals
+
+    except Exception as e:
+
+        logging.warning(
+
+            "PREMATCH ENGINE ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return []
+
+
+# =========================================================
+# PREMATCH SCANNER
+# =========================================================
+
+def scan_prematch_matches(
+
+    matches
+
+):
+
+    candidates = []
+
+    for match in matches:
+
+        try:
+
+            signals = analyze_prematch(
+
+                match
+
+            )
+
+            if not signals:
+
+                continue
+
+            best = signals[0]
+
+            candidates.append(
+
+                best
+
+            )
+
+        except Exception as e:
+
+            logging.warning(
+
+                "PREMATCH MATCH ERROR: %s",
+
+                repr(e)
+
+            )
+
+    candidates.sort(
+
+        key=lambda x: (
+
+            x["confidence"],
+
+            x["probability"],
+
+            x["edge"],
+
+            -x["risk"]
+
+        ),
+
+        reverse=True
+
+    )
+
+    return candidates[
+
+        :PREMATCH_MAX_SIGNALS
+
+    ]
+
+
+# =========================================================
+# PREMATCH MESSAGE
+# =========================================================
+
+def format_prematch_signal(
+
+    signal
+
+):
+
+    return (
+
+        "🔥 PREMATCH V4\n\n"
+
+        f"⚽ {signal['home_team']} "
+
+        f"- {signal['away_team']}\n"
+
+        f"🏆 {signal['league']}\n\n"
+
+        f"🎯 {signal['market']}\n\n"
+
+        f"📈 Probability: "
+
+        f"{signal['probability']:.1f}%\n"
+
+        f"🤖 Confidence: "
+
+        f"{signal['confidence']:.1f}%\n"
+
+        f"💰 Odds: "
+
+        f"{signal['odd']:.2f}\n"
+
+        f"💎 Edge: "
+
+        f"{signal['edge']:+.1f}%\n"
+
+        f"🛡 Risk: "
+
+        f"{signal['risk']}"
+
+    )
+
+# =========================================================
+# LIVE CORE V4
+# =========================================================
+
+LIVE_MINUTE = 25
+
+LIVE_MIN_PROBABILITY = 72
+
+LIVE_MIN_CONFIDENCE = 78
+
+LIVE_MAX_RISK = 35
+
+LIVE_MAX_SIGNALS = 5
+
+LIVE_COOLDOWN = 600
+
+
+# =========================================================
+# LIVE STATISTICS PARSER
+# =========================================================
+
+def parse_live_statistics(
+    statistics
+):
+
+    home = {}
+    away = {}
+
+    if not statistics:
+        return home, away
+
+    try:
+        for team_data in statistics:
+
+            team = team_data.get(
+                "team",
+                {}
+            )
+
+            team_id = team.get(
+                "id"
+            )
+
+            stats = {}
+
+            for item in team_data.get(
+                "statistics",
+                []
+            ):
+
+                name = clean_text(
+                    item.get("type")
+                )
+
+                value = item.get(
+                    "value"
+                )
+
+                if isinstance(
+                    value,
+                    str
+                ):
+
+                    value = value.replace(
+                        "%",
+                        ""
+                    )
+
+                number = safe_float(
+                    value
+                )
+
+                stats[name] = (
+                    number
+                    if number is not None
+                    else 0
+                )
+
+            if team_id is not None:
+
+                if not home:
+                    home = {
+                        "id": team_id,
+                        "stats": stats
+                    }
+
+                else:
+                    away = {
+                        "id": team_id,
+                        "stats": stats
+                    }
+
+    except Exception as e:
+
+        logging.warning(
+            "LIVE STAT PARSE ERROR: %s",
+            repr(e)
+        )
+
+    return home, away
+
+
+# =========================================================
+# LIVE TEAM STAT HELPERS
+# =========================================================
+
+def live_stat(
+    data,
+    name
+):
+
+    try:
+
+        return float(
+            data.get(
+                "stats",
+                {}
+            ).get(
+                clean_text(name),
+                0
+            )
+        )
+
+    except Exception:
+
+        return 0.0
+
+
+# =========================================================
+# LIVE ATTACK SCORE
+# =========================================================
+
+def calculate_attack_score(
+    shots,
+    shots_on,
+    dangerous_attacks,
+    corners
+):
+
+    score = 0
+
+    # Shots on target are most important.
+    score += min(
+        40,
+        shots_on * 8
+    )
+
+    # Total shots.
+    score += min(
+        25,
+        shots * 2
+    )
+
+    # Dangerous attacks.
+    score += min(
+        25,
+        dangerous_attacks * 0.5
+    )
+
+    # Corners.
+    score += min(
+        10,
+        corners * 2
+    )
+
+    return round(
+        min(
+            100,
+            score
+        ),
+        1
+    )
+
+
+# =========================================================
+# LIVE PRESSURE SCORE
+# =========================================================
+
+def calculate_pressure_score(
+    attack,
+    possession,
+    corners,
+    shots_on
+):
+
+    pressure = (
+
+        attack * 0.50
+
+        +
+
+        possession * 0.15
+
+        +
+
+        min(
+            100,
+            corners * 8
+        ) * 0.15
+
+        +
+
+        min(
+            100,
+            shots_on * 12
+        ) * 0.20
+
+    )
+
+    return round(
+        min(
+            100,
+            pressure
+        ),
+        1
+    )
+
+
+# =========================================================
+# LIVE GOAL PROBABILITY
+# =========================================================
+
+def live_goal_probability(
+    attack,
+    pressure,
+    xg,
+    minute,
+    score_difference
+):
+
+    probability = 50
+
+    # Main attacking factors.
+    probability += (
+        attack - 50
+    ) * 0.25
+
+    probability += (
+        pressure - 50
+    ) * 0.25
+
+    # xG.
+    probability += min(
+        20,
+        max(
+            0,
+            xg * 7
+        )
+    )
+
+    # Active part of the match.
+    if 55 <= minute <= 80:
+
+        probability += 5
+
+    elif minute >= 80:
+
+        probability += 3
+
+    # Close score increases motivation.
+    if abs(
+        score_difference
+    ) <= 1:
+
+        probability += 4
+
+    # Very early matches are less reliable.
+    if minute < 30:
+
+        probability -= 8
+
+    return round(
+        max(
+            0,
+            min(
+                95,
+                probability
+            )
+        ),
+        1
+    )
+
+
+# =========================================================
+# LIVE RISK
+# =========================================================
+
+def calculate_live_risk(
+    probability,
+    confidence,
+    attack,
+    pressure,
+    minute,
+    shots_on
+):
+
+    risk = 0
+
+    # Probability.
+    if probability < 70:
+
+        risk += 15
+
+    elif probability < 75:
+
+        risk += 8
+
+    # Confidence.
+    if confidence < 75:
+
+        risk += 15
+
+    elif confidence < 80:
+
+        risk += 8
+
+    # Weak attack.
+    if attack < 60:
+
+        risk += 10
+
+    # Weak pressure.
+    if pressure < 60:
+
+        risk += 10
+
+    # Too early.
+    if minute < 35:
+
+        risk += 10
+
+    # No shots on target.
+    if shots_on == 0:
+
+        risk += 8
+
+    return min(
+        100,
+        risk
+    )
+
+
+# =========================================================
+# LIVE CONFIDENCE
+# =========================================================
+
+def calculate_live_confidence(
+    probability,
+    attack,
+    pressure,
+    xg,
+    shots_on,
+    minute,
+    score_difference
+):
+
+    confidence = 50
+
+    # Probability.
+    confidence += (
+        probability - 60
+    ) * 0.35
+
+    # Attack.
+    confidence += (
+        attack - 60
+    ) * 0.15
+
+    # Pressure.
+    confidence += (
+        pressure - 60
+    ) * 0.15
+
+    # xG.
+    confidence += min(
+        10,
+        max(
+            0,
+            xg * 4
+        )
+    )
+
+    # Shots on target.
+    confidence += min(
+        8,
+        shots_on * 1.5
+    )
+
+    # Best live period.
+    if 55 <= minute <= 80:
+
+        confidence += 5
+
+    # Close match.
+    if abs(
+        score_difference
+    ) <= 1:
+
+        confidence += 3
+
+    return round(
+        max(
+            0,
+            min(
+                95,
+                confidence
+            )
+        ),
+        1
+    )
+
+
+# =========================================================
+# LIVE VALUE
+# =========================================================
+
+def calculate_live_value(
+    probability,
+    odd
+):
+
+    if odd is None:
+
+        return 0
+
+    if odd <= 1.01:
+
+        return 0
+
+    return value_edge(
+        probability,
+        odd
+    )
+
+
+# =========================================================
+# LIVE SIGNAL BUILDER
+# =========================================================
+
+def build_live_signal(
+    market,
+    probability,
+    confidence,
+    risk,
+    odd,
+    match,
+    minute,
+    attack,
+    pressure,
+    xg
+):
+
+    if odd is None:
+
+        return None
+
+    if probability < LIVE_MIN_PROBABILITY:
+
+        return None
+
+    if confidence < LIVE_MIN_CONFIDENCE:
+
+        return None
+
+    if risk > LIVE_MAX_RISK:
+
+        return None
+
+    edge = calculate_live_value(
+        probability,
+        odd
+    )
+
+    # Do not force huge value.
+    # Probability + confidence are more important.
+    if edge < -3:
+
+        return None
+
+    fixture = match.get(
+        "fixture",
+        {}
+    )
+
+    teams = match.get(
+        "teams",
+        {}
+    )
+
+    league = match.get(
+        "league",
+        {}
+    )
+
+    return {
+
+        "fixture_id":
+            fixture.get("id"),
+
+        "home_team":
+            teams.get(
+                "home",
+                {}
+            ).get(
+                "name",
+                "HOME"
+            ),
+
+        "away_team":
+            teams.get(
+                "away",
+                {}
+            ).get(
+                "name",
+                "AWAY"
+            ),
+
+        "league":
+            league.get(
+                "name",
+                ""
+            ),
+
+        "market":
+            market,
+
+        "probability":
+            round(
+                probability,
+                1
+            ),
+
+        "confidence":
+            round(
+                confidence,
+                1
+            ),
+
+        "risk":
+            risk,
+
+        "odd":
+            odd,
+
+        "edge":
+            edge,
+
+        "minute":
+            minute,
+
+        "attack":
+            attack,
+
+        "pressure":
+            pressure,
+
+        "xg":
+            round(
+                xg,
+                2
+            )
+
+    }
+
+
+# =========================================================
+# LIVE NEXT GOAL ANALYZER
+# =========================================================
+
+def analyze_live_match(
+    match
+):
+
+    try:
+
+        fixture = match.get(
+            "fixture",
+            {}
+        )
+
+        fixture_id = fixture.get(
+            "id"
+        )
+
+        if not fixture_id:
+
+            return []
+
+        status = fixture.get(
+            "status",
+            {}
+        )
+
+        elapsed = status.get(
+            "elapsed"
+        )
+
+        if elapsed is None:
+
+            return []
+
+        minute = int(
+            elapsed
+        )
+
+        if minute < LIVE_MINUTE:
+
+            return []
+
+        teams = match.get(
+            "teams",
+            {}
+        )
+
+        home_team = teams.get(
+            "home",
+            {}
+        )
+
+        away_team = teams.get(
+            "away",
+            {}
+        )
+
+        home_id = home_team.get(
+            "id"
+        )
+
+        away_id = away_team.get(
+            "id"
+        )
+
+        if not home_id or not away_id:
+
+            return []
+
+        home_goals = (
+            match.get(
+                "goals",
+                {}
+            ).get(
+                "home"
+            )
+            or 0
+        )
+
+        away_goals = (
+            match.get(
+                "goals",
+                {}
+            ).get(
+                "away"
+            )
+            or 0
+        )
+
+        score_difference = (
+            home_goals
+            -
+            away_goals
+        )
+
+        # =================================================
+        # STATISTICS
+        # =================================================
+
+        statistics = get_statistics(
+            fixture_id
+        )
+
+        home_stats, away_stats = (
+            parse_live_statistics(
+                statistics
+            )
+        )
+
+        # =================================================
+        # HOME
+        # =================================================
+
+        home_shots = live_stat(
+            home_stats,
+            "total shots"
+        )
+
+        home_shots_on = live_stat(
+            home_stats,
+            "shots on goal"
+        )
+
+        home_dangerous = live_stat(
+            home_stats,
+            "dangerous attacks"
+        )
+
+        home_corners = live_stat(
+            home_stats,
+            "corner kicks"
+        )
+
+        home_possession = live_stat(
+            home_stats,
+            "ball possession"
+        )
+
+        # =================================================
+        # AWAY
+        # =================================================
+
+        away_shots = live_stat(
+            away_stats,
+            "total shots"
+        )
+
+        away_shots_on = live_stat(
+            away_stats,
+            "shots on goal"
+        )
+
+        away_dangerous = live_stat(
+            away_stats,
+            "dangerous attacks"
+        )
+
+        away_corners = live_stat(
+            away_stats,
+            "corner kicks"
+        )
+
+        away_possession = live_stat(
+            away_stats,
+            "ball possession"
+        )
+
+        # =================================================
+        # ATTACK SCORES
+        # =================================================
+
+        home_attack = calculate_attack_score(
+            home_shots,
+            home_shots_on,
+            home_dangerous,
+            home_corners
+        )
+
+        away_attack = calculate_attack_score(
+            away_shots,
+            away_shots_on,
+            away_dangerous,
+            away_corners
+        )
+
+        home_pressure = calculate_pressure_score(
+            home_attack,
+            home_possession,
+            home_corners,
+            home_shots_on
+        )
+
+        away_pressure = calculate_pressure_score(
+            away_attack,
+            away_possession,
+            away_corners,
+            away_shots_on
+        )
+
+        # =================================================
+        # xG
+        # =================================================
+
+        home_xg = live_stat(
+            home_stats,
+            "expected goals"
+        )
+
+        away_xg = live_stat(
+            away_stats,
+            "expected goals"
+        )
+
+        total_xg = (
+            home_xg
+            +
+            away_xg
+        )
+
+        total_shots = (
+            home_shots
+            +
+            away_shots
+        )
+
+        total_shots_on = (
+            home_shots_on
+            +
+            away_shots_on
+        )
+
+        # =================================================
+        # SELECT STRONGER SIDE
+        # =================================================
+
+        if (
+
+            home_attack >=
+            away_attack
+
+        ):
+
+            best_team = "HOME"
+
+            best_attack = home_attack
+
+            best_pressure = home_pressure
+
+            best_shots_on = home_shots_on
+
+        else:
+
+            best_team = "AWAY"
+
+            best_attack = away_attack
+
+            best_pressure = away_pressure
+
+            best_shots_on = away_shots_on
+
+        # =================================================
+        # MAIN PROBABILITY
+        # =================================================
+
+        probability = live_goal_probability(
+
+            best_attack,
+
+            best_pressure,
+
+            total_xg,
+
+            minute,
+
+            score_difference
+
+        )
+
+        # =================================================
+        # CONFIDENCE
+        # =================================================
+
+        confidence = calculate_live_confidence(
+
+            probability,
+
+            best_attack,
+
+            best_pressure,
+
+            total_xg,
+
+            best_shots_on,
+
+            minute,
+
+            score_difference
+
+        )
+
+        # =================================================
+        # RISK
+        # =================================================
+
+        risk = calculate_live_risk(
+
+            probability,
+
+            confidence,
+
+            best_attack,
+
+            best_pressure,
+
+            minute,
+
+            best_shots_on
+
+        )
+
+        print(
+
+            "LIVE:",
+
+            home_team.get(
+                "name"
+            ),
+
+            "-",
+
+            away_team.get(
+                "name"
+            ),
+
+            "|",
+
+            minute,
+
+            "| ATTACK",
+
+            round(
+                best_attack,
+                1
+            ),
+
+            "| PRESSURE",
+
+            round(
+                best_pressure,
+                1
+            ),
+
+            "| xG",
+
+            round(
+                total_xg,
+                2
+            ),
+
+            "| PROB",
+
+            probability,
+
+            "| CONF",
+
+            confidence,
+
+            "| RISK",
+
+            risk
+
+        )
+
+        # =================================================
+        # ODDS
+        # =================================================
+
+        odds = get_match_odds(
+            fixture_id
+        )
+
+        if odds is None:
+
+            return []
+
+        (
+            home_odd,
+            draw_odd,
+            away_odd,
+            over25_odd,
+            under25_odd,
+            over35_odd,
+            under35_odd,
+            btts_odd,
+            home15_odd,
+            away15_odd
+
+        ) = odds
+
+        signals = []
+
+        # =================================================
+        # NEXT GOAL
+        # =================================================
+
+        # We use the stronger attacking side.
+        # No unnecessary bonuses.
+
+        if best_team == "HOME":
+
+            market = "🎯 NEXT GOAL HOME"
+
+            odd = None
+
+            # API-Football usually exposes
+            # live next-goal markets separately.
+            # If unavailable, do not invent an odd.
+
+        else:
+
+            market = "🎯 NEXT GOAL AWAY"
+
+            odd = None
+
+        # =================================================
+        # TEMPORARY LIVE ODDS
+        # =================================================
+
+        # Next-goal odds are intentionally left empty here.
+        # The live market parser will be connected separately.
+        #
+        # This prevents the system from using
+        # pre-match 1X2 odds as fake live odds.
+
+        if odd is not None:
+
+            signal = build_live_signal(
+
+                market,
+
+                probability,
+
+                confidence,
+
+                risk,
+
+                odd,
+
+                match,
+
+                minute,
+
+                best_attack,
+
+                best_pressure,
+
+                total_xg
+
+            )
+
+            if signal:
+
+                signals.append(
+                    signal
+                )
+
+        # =================================================
+        # LIVE QUALITY CHECK
+        # =================================================
+
+        # Even without odds we can identify
+        # whether the match deserves monitoring.
+
+        if (
+
+            probability >= 78
+
+            and
+
+            confidence >= 82
+
+            and
+
+            risk <= 25
+
+            and
+
+            best_attack >= 70
+
+            and
+
+            best_pressure >= 65
+
+        ):
+
+            print(
+
+                "🔥 LIVE QUALITY MATCH:",
+
+                home_team.get(
+                    "name"
+                ),
+
+                "-",
+
+                away_team.get(
+                    "name"
+                ),
+
+                "|",
+
+                "PROB",
+
+                probability,
+
+                "|",
+
+                "CONF",
+
+                confidence
+
+            )
+
+        return signals
+
+    except Exception as e:
+
+        logging.warning(
+
+            "LIVE ENGINE ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return []
+
+
+# =========================================================
+# LIVE SCANNER
+# =========================================================
+
+def scan_live_matches(
+    matches
+):
+
+    candidates = []
+
+    for match in matches:
+
+        try:
+
+            signals = analyze_live_match(
+                match
+            )
+
+            if not signals:
+
+                continue
+
+            candidates.extend(
+                signals
+            )
+
+        except Exception as e:
+
+            logging.warning(
+
+                "LIVE MATCH ERROR: %s",
+
+                repr(e)
+
+            )
+
+    candidates.sort(
+
+        key=lambda x: (
+
+            x["confidence"],
+
+            x["probability"],
+
+            x["edge"],
+
+            -x["risk"]
+
+        ),
+
+        reverse=True
+
+    )
+
+    return candidates[
+        :LIVE_MAX_SIGNALS
+    ]
+
+
+# =========================================================
+# LIVE MESSAGE
+# =========================================================
+
+def format_live_signal(
+    signal
+):
+
+    return (
+
+        "🔥 LIVE V4\n\n"
+
+        f"⚽ {signal['home_team']} "
+
+        f"- {signal['away_team']}\n"
+
+        f"🏆 {signal['league']}\n\n"
+
+        f"🎯 {signal['market']}\n\n"
+
+        f"⏱ Minute: "
+
+        f"{signal['minute']}\n"
+
+        f"📈 Probability: "
+
+        f"{signal['probability']:.1f}%\n"
+
+        f"🤖 Confidence: "
+
+        f"{signal['confidence']:.1f}%\n"
+
+        f"⚡ Attack: "
+
+        f"{signal['attack']:.1f}\n"
+
+        f"🔥 Pressure: "
+
+        f"{signal['pressure']:.1f}\n"
+
+        f"📊 xG: "
+
+        f"{signal['xg']:.2f}\n"
+
+        f"🛡 Risk: "
+
+        f"{signal['risk']}"
+
+    )
+
+# =========================================================
+# LIVE ODDS ENGINE V4
+# =========================================================
+
+LIVE_ODDS_CACHE_TIME = 30
+
+live_odds_cache = {}
+
+
+# =========================================================
+# GET LIVE ODDS
+# =========================================================
+
+def get_live_odds(fixture_id):
+
+    if fixture_id in live_odds_cache:
+
+        cache_time, data = live_odds_cache[
+            fixture_id
+        ]
+
+        if time.time() - cache_time < LIVE_ODDS_CACHE_TIME:
+
+            return data
+
+    data = api_get(
+        "odds/live",
+        {
+            "fixture": fixture_id
+        }
+    )
+
+    result = data.get(
+        "response",
+        []
+    )
+
+    live_odds_cache[fixture_id] = (
+        time.time(),
+        result
+    )
+
+    return result
+
+
+# =========================================================
+# LIVE BET NAME MATCHER
+# =========================================================
+
+def is_next_goal_market(name):
+
+    name = clean_text(name)
+
+    return (
+
+        "next goal" in name
+
+        or
+
+        "next goal scorer" in name
+
+        or
+
+        "next team to score" in name
+
+    )
+
+
+# =========================================================
+# LIVE ODDS PARSER
+# =========================================================
+
+def parse_live_next_goal_odds(
+    fixture_id,
+    home_team,
+    away_team
+):
+
+    data = get_live_odds(
+        fixture_id
+    )
+
+    if not data:
+
+        return None
+
+    home_odd = None
+    away_odd = None
+
+    home_name = clean_text(
+        home_team
+    )
+
+    away_name = clean_text(
+        away_team
+    )
+
+    try:
+
+        for bookmaker in data:
+
+            bets = bookmaker.get(
+                "bets",
+                []
+            )
+
+            for bet in bets:
+
+                bet_name = clean_text(
+                    bet.get("name")
+                )
+
+                if not is_next_goal_market(
+                    bet_name
+                ):
+
+                    continue
+
+                for value in bet.get(
+                    "values",
+                    []
+                ):
+
+                    value_name = clean_text(
+                        value.get("value")
+                    )
+
+                    odd = safe_float(
+                        value.get("odd")
+                    )
+
+                    if odd is None:
+
+                        continue
+
+                    # =====================================
+                    # HOME
+                    # =====================================
+
+                    if (
+
+                        value_name == home_name
+
+                        or
+
+                        value_name == "home"
+
+                        or
+
+                        home_name in value_name
+
+                    ):
+
+                        home_odd = odd
+
+                    # =====================================
+                    # AWAY
+                    # =====================================
+
+                    elif (
+
+                        value_name == away_name
+
+                        or
+
+                        value_name == "away"
+
+                        or
+
+                        away_name in value_name
+
+                    ):
+
+                        away_odd = odd
+
+        if (
+
+            home_odd is None
+
+            and
+
+            away_odd is None
+
+        ):
+
+            return None
+
+        return {
+
+            "home":
+
+                home_odd,
+
+            "away":
+
+                away_odd
+
+        }
+
+    except Exception as e:
+
+        logging.warning(
+            "LIVE ODDS PARSE ERROR: %s",
+            repr(e)
+        )
+
+        return None
+
+
+# =========================================================
+# LIVE MARKET PROBABILITY ADJUSTMENT
+# =========================================================
+
+def adjust_live_probability(
+    probability,
+    odd
+):
+
+    if odd is None:
+
+        return probability
+
+    if odd <= 1.01:
+
+        return probability
+
+    implied = (
+        100 / odd
+    )
+
+    # Market should influence the model,
+    # but never completely replace it.
+
+    difference = (
+        probability
+        -
+        implied
+    )
+
+    if difference >= 20:
+
+        probability += 3
+
+    elif difference >= 10:
+
+        probability += 1
+
+    elif difference <= -20:
+
+        probability -= 5
+
+    elif difference <= -10:
+
+        probability -= 2
+
+    return round(
+        max(
+            0,
+            min(
+                95,
+                probability
+            )
+        ),
+        1
+    )
+
+
+# =========================================================
+# LIVE SIGNAL SCORE
+# =========================================================
+
+def live_signal_score(
+    probability,
+    confidence,
+    edge,
+    risk
+):
+
+    score = (
+
+        probability * 0.40
+
+        +
+
+        confidence * 0.35
+
+        +
+
+        max(
+            0,
+            edge
+        ) * 0.15
+
+        -
+
+        risk * 0.10
+
+    )
+
+    return round(
+        score,
+        2
+    )
+
+
+# =========================================================
+# FINAL LIVE SIGNAL
+# =========================================================
+
+def build_final_live_signal(
+    match,
+    market,
+    probability,
+    confidence,
+    risk,
+    odd,
+    minute,
+    attack,
+    pressure,
+    xg
+):
+
+    if odd is None:
+
+        return None
+
+    # ================================================
+    # MARKET ADJUSTMENT
+    # ================================================
+
+    probability = adjust_live_probability(
+        probability,
+        odd
+    )
+
+    # ================================================
+    # VALUE
+    # ================================================
+
+    edge = value_edge(
+        probability,
+        odd
+    )
+
+    # ================================================
+    # FINAL FILTER
+    # ================================================
+
+    if probability < LIVE_MIN_PROBABILITY:
+
+        return None
+
+    if confidence < LIVE_MIN_CONFIDENCE:
+
+        return None
+
+    if risk > LIVE_MAX_RISK:
+
+        return None
+
+    # We don't want clearly negative value.
+    if edge < 0:
+
+        return None
+
+    score = live_signal_score(
+        probability,
+        confidence,
+        edge,
+        risk
+    )
+
+    teams = match.get(
+        "teams",
+        {}
+    )
+
+    league = match.get(
+        "league",
+        {}
+    )
+
+    fixture = match.get(
+        "fixture",
+        {}
+    )
+
+    return {
+
+        "fixture_id":
+            fixture.get("id"),
+
+        "home_team":
+            teams.get(
+                "home",
+                {}
+            ).get(
+                "name",
+                "HOME"
+            ),
+
+        "away_team":
+            teams.get(
+                "away",
+                {}
+            ).get(
+                "name",
+                "AWAY"
+            ),
+
+        "league":
+            league.get(
+                "name",
+                ""
+            ),
+
+        "market":
+            market,
+
+        "probability":
+            probability,
+
+        "confidence":
+            round(
+                confidence,
+                1
+            ),
+
+        "risk":
+            risk,
+
+        "odd":
+            odd,
+
+        "edge":
+            edge,
+
+        "score":
+            score,
+
+        "minute":
+            minute,
+
+        "attack":
+            round(
+                attack,
+                1
+            ),
+
+        "pressure":
+            round(
+                pressure,
+                1
+            ),
+
+        "xg":
+            round(
+                xg,
+                2
+            )
+
+    }
+
+
+# =========================================================
+# REPLACE LIVE SIGNAL SECTION
+# =========================================================
+
+def get_best_live_signal(
+    match
+):
+
+    try:
+
+        fixture_id = match.get(
+            "fixture",
+            {}
+        ).get(
+            "id"
+        )
+
+        if not fixture_id:
+
+            return None
+
+        teams = match.get(
+            "teams",
+            {}
+        )
+
+        home_team = teams.get(
+            "home",
+            {}
+        ).get(
+            "name",
+            "HOME"
+        )
+
+        away_team = teams.get(
+            "away",
+            {}
+        ).get(
+            "name",
+            "AWAY"
+        )
+
+        # =============================================
+        # RUN LIVE CORE
+        # =============================================
+
+        base_signals = analyze_live_match(
+            match
+        )
+
+        if not base_signals:
+
+            return None
+
+        # =============================================
+        # GET STRONGEST BASE SIGNAL
+        # =============================================
+
+        base = max(
+
+            base_signals,
+
+            key=lambda x: (
+
+                x.get(
+                    "confidence",
+                    0
+                ),
+
+                x.get(
+                    "probability",
+                    0
+                )
+
+            )
+
+        )
+
+        market = base[
+            "market"
+        ]
+
+        probability = base[
+            "probability"
+        ]
+
+        confidence = base[
+            "confidence"
+        ]
+
+        risk = base[
+            "risk"
+        ]
+
+        minute = base[
+            "minute"
+        ]
+
+        attack = base[
+            "attack"
+        ]
+
+        pressure = base[
+            "pressure"
+        ]
+
+        xg = base[
+            "xg"
+        ]
+
+        # =============================================
+        # LIVE ODDS
+        # =============================================
+
+        live_odds = parse_live_next_goal_odds(
+
+            fixture_id,
+
+            home_team,
+
+            away_team
+
+        )
+
+        if not live_odds:
+
+            print(
+                "NO LIVE NEXT GOAL ODDS:",
+                home_team,
+                "-",
+                away_team
+            )
+
+            return None
+
+        # =============================================
+        # SELECT CORRECT SIDE
+        # =============================================
+
+        if market == "🎯 NEXT GOAL HOME":
+
+            odd = live_odds.get(
+                "home"
+            )
+
+        else:
+
+            odd = live_odds.get(
+                "away"
+            )
+
+        if odd is None:
+
+            return None
+
+        # =============================================
+        # FINAL SIGNAL
+        # =============================================
+
+        signal = build_final_live_signal(
+
+            match,
+
+            market,
+
+            probability,
+
+            confidence,
+
+            risk,
+
+            odd,
+
+            minute,
+
+            attack,
+
+            pressure,
+
+            xg
+
+        )
+
+        if signal is None:
+
+            return None
+
+        print(
+            "LIVE SIGNAL:",
+            signal
+        )
+
+        return signal
+
+    except Exception as e:
+
+        logging.warning(
+            "FINAL LIVE SIGNAL ERROR: %s",
+            repr(e)
+        )
+
+        return None
+
+
+# =========================================================
+# SIGNAL COOLDOWN
+# =========================================================
+
+def live_signal_allowed(
+    fixture_id,
+    market,
+    minute
+):
+
+    key = (
+        f"{fixture_id}_"
+        f"{market}"
+    )
+
+    now = time.time()
+
+    previous = sent_live.get(
+        key
+    )
+
+    if previous is None:
+
+        sent_live[key] = {
+            "time": now,
+            "minute": minute
+        }
+
+        return True
+
+    elapsed = (
+        now
+        -
+        previous["time"]
+    )
+
+    # Normal cooldown.
+    if elapsed >= LIVE_COOLDOWN:
+
+        sent_live[key] = {
+            "time": now,
+            "minute": minute
+        }
+
+        return True
+
+    # New goal = new opportunity.
+    if minute > previous["minute"]:
+
+        sent_live[key] = {
+            "time": now,
+            "minute": minute
+        }
+
+        return True
+
+    return False
+
+
+# =========================================================
+# SAVE SIGNAL TO DATABASE
+# =========================================================
+
+def save_signal(
+    signal
+):
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_NAME
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+
+            """
+            INSERT INTO signals(
+
+                fixture_id,
+                country,
+                league,
+                home_team,
+                away_team,
+                market,
+                probability,
+                odd,
+                confidence,
+                result,
+                created_at
+
+            )
+
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+
+            (
+
+                signal.get(
+                    "fixture_id"
+                ),
+
+                signal.get(
+                    "country",
+                    ""
+                ),
+
+                signal.get(
+                    "league",
+                    ""
+                ),
+
+                signal.get(
+                    "home_team"
+                ),
+
+                signal.get(
+                    "away_team"
+                ),
+
+                signal.get(
+                    "market"
+                ),
+
+                signal.get(
+                    "probability"
+                ),
+
+                signal.get(
+                    "odd"
+                ),
+
+                signal.get(
+                    "confidence"
+                ),
+
+                None,
+
+                datetime.now(
+                    TIMEZONE
+                ).isoformat()
+
+            )
+
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        return True
+
+    except Exception as e:
+
+        logging.warning(
+            "DB SAVE ERROR: %s",
+            repr(e)
+        )
+
+        return False
+
+
+# =========================================================
+# SEND LIVE SIGNAL
+# =========================================================
+
+def send_live_signal(
+    signal
+):
+
+    fixture_id = signal.get(
+        "fixture_id"
+    )
+
+    market = signal.get(
+        "market"
+    )
+
+    minute = signal.get(
+        "minute",
+        0
+    )
+
+    if not live_signal_allowed(
+
+        fixture_id,
+
+        market,
+
+        minute
+
+    ):
+
+        return False
+
+    message = format_live_signal(
+        signal
+    )
+
+    if not send_telegram(
+        message
+    ):
+
+        return False
+
+    save_signal(
+        signal
+    )
+
+    return True
+
+
+# =========================================================
+# LIVE MASTER SCANNER
+# =========================================================
+
+def process_live_matches(
+    matches
+):
+
+    sent = 0
+
+    for match in matches:
+
+        try:
+
+            signal = get_best_live_signal(
+                match
+            )
+
+            if not signal:
+
+                continue
+
+            if send_live_signal(
+                signal
+            ):
+
+                sent += 1
+
+        except Exception as e:
+
+            logging.warning(
+
+                "LIVE PROCESS ERROR: %s",
+
+                repr(e)
+
+            )
+
+    return sent
+
+# =========================================================
+# MAIN V4 - SIGNAL SCANNER
+# =========================================================
+
+PREMATCH_SCAN_INTERVAL = 300
+LIVE_SCAN_INTERVAL = 30
+
+MAX_LIVE_SIGNALS_PER_SCAN = 5
+MAX_PREMATCH_SIGNALS_PER_SCAN = 5
+
+MIN_LIVE_CONFIDENCE = 85
+MIN_LIVE_PROBABILITY = 75
+MAX_LIVE_RISK = 30
+
+MIN_PREMATCH_CONFIDENCE = 80
+MIN_PREMATCH_PROBABILITY = 65
+
+LIVE_COOLDOWN = 600
+
+LAST_PREMATCH_SCAN = 0
+LAST_LIVE_SCAN = 0
+
+
+# =========================================================
+# GLOBAL SIGNAL MEMORY
+# =========================================================
+
+SIGNAL_MEMORY = {}
+
+LIVE_SIGNAL_MEMORY = {}
+
+PREMATCH_SIGNAL_MEMORY = {}
+
+
+# =========================================================
+# SIGNAL KEY
+# =========================================================
+
+def signal_key(
+    fixture_id,
+    market
+):
+
+    return (
+        f"{fixture_id}_"
+        f"{market}"
+    )
+
+
+# =========================================================
+# DUPLICATE CHECK
+# =========================================================
+
+def signal_already_sent(
+    fixture_id,
+    market
+):
+
+    key = signal_key(
+        fixture_id,
+        market
+    )
+
+    return key in SIGNAL_MEMORY
+
+
+def remember_signal(
+    signal
+):
+
+    fixture_id = signal.get(
+        "fixture_id"
+    )
+
+    market = signal.get(
+        "market"
+    )
+
+    if fixture_id is None:
+
+        return
+
+    key = signal_key(
+        fixture_id,
+        market
+    )
+
+    SIGNAL_MEMORY[key] = {
+
+        "time": time.time(),
+
+        "probability":
+            signal.get(
+                "probability"
+            ),
+
+        "confidence":
+            signal.get(
+                "confidence"
+            ),
+
+        "odd":
+            signal.get(
+                "odd"
+            )
+
+    }
+
+
+# =========================================================
+# CLEAN OLD MEMORY
+# =========================================================
+
+def cleanup_signal_memory():
+
+    now = time.time()
+
+    expired = []
+
+    for key, data in SIGNAL_MEMORY.items():
+
+        if (
+
+            now
+            -
+            data.get(
+                "time",
+                now
+            )
+
+            >
+
+            21600
+
+        ):
+
+            expired.append(
+                key
+            )
+
+    for key in expired:
+
+        SIGNAL_MEMORY.pop(
+            key,
+            None
+        )
+
+
+# =========================================================
+# PREMATCH SIGNAL NORMALIZER
+# =========================================================
+
+def normalize_prematch_signal(
+    signal
+):
+
+    if not signal:
+
+        return None
+
+    result = dict(
+        signal
+    )
+
+    result.setdefault(
+        "probability",
+        0
+    )
+
+    result.setdefault(
+        "confidence",
+        0
+    )
+
+    result.setdefault(
+        "risk",
+        100
+    )
+
+    result.setdefault(
+        "score",
+        0
+    )
+
+    result.setdefault(
+        "odd",
+        None
+    )
+
+    return result
+
+
+# =========================================================
+# PREMATCH QUALITY CHECK
+# =========================================================
+
+def prematch_signal_allowed(
+    signal
+):
+
+    signal = normalize_prematch_signal(
+        signal
+    )
+
+    if signal is None:
+
+        return False
+
+    probability = signal.get(
+        "probability",
+        0
+    )
+
+    confidence = signal.get(
+        "confidence",
+        0
+    )
+
+    risk = signal.get(
+        "risk",
+        100
+    )
+
+    odd = signal.get(
+        "odd"
+    )
+
+    if probability < MIN_PREMATCH_PROBABILITY:
+
+        return False
+
+    if confidence < MIN_PREMATCH_CONFIDENCE:
+
+        return False
+
+    if risk > 35:
+
+        return False
+
+    if odd is not None:
+
+        if odd < 1.50:
+
+            return False
+
+        if odd > 4.00:
+
+            return False
+
+    return True
+
+
+# =========================================================
+# PREMATCH SIGNAL SCORE
+# =========================================================
+
+def prematch_signal_score(
+    signal
+):
+
+    probability = signal.get(
+        "probability",
+        0
+    )
+
+    confidence = signal.get(
+        "confidence",
+        0
+    )
+
+    quality = signal.get(
+        "quality",
+        confidence
+    )
+
+    value = signal.get(
+        "value_score",
+        0
+    )
+
+    risk = signal.get(
+        "risk",
+        50
+    )
+
+    score = (
+
+        probability * 0.35
+
+        +
+
+        confidence * 0.35
+
+        +
+
+        quality * 0.15
+
+        +
+
+        value * 0.15
+
+        -
+
+        risk * 0.15
+
+    )
+
+    return round(
+        score,
+        2
+    )
+
+
+# =========================================================
+# GET BEST PREMATCH SIGNALS
+# =========================================================
+
+def get_best_prematch_signals(
+    matches
+):
+
+    candidates = []
+
+    for match in matches:
+
+        try:
+
+            signals = analyze_prematch(
+                match
+            )
+
+            if not signals:
+
+                continue
+
+            if isinstance(
+                signals,
+                dict
+            ):
+
+                signals = [
+                    signals
+                ]
+
+            for signal in signals:
+
+                signal = normalize_prematch_signal(
+                    signal
+                )
+
+                if signal is None:
+
+                    continue
+
+                if not prematch_signal_allowed(
+                    signal
+                ):
+
+                    continue
+
+                fixture_id = signal.get(
+                    "fixture_id"
+                )
+
+                market = signal.get(
+                    "market"
+                )
+
+                if fixture_id is None:
+
+                    fixture_id = match.get(
+                        "fixture",
+                        {}
+                    ).get(
+                        "id"
+                    )
+
+                    signal[
+                        "fixture_id"
+                    ] = fixture_id
+
+                if signal_already_sent(
+                    fixture_id,
+                    market
+                ):
+
+                    continue
+
+                signal[
+                    "score"
+                ] = prematch_signal_score(
+                    signal
+                )
+
+                candidates.append(
+                    signal
+                )
+
+        except Exception as e:
+
+            logging.warning(
+
+                "PREMATCH ANALYSIS ERROR: %s",
+
+                repr(e)
+
+            )
+
+    candidates.sort(
+
+        key=lambda x: (
+
+            x.get(
+                "score",
+                0
+            ),
+
+            x.get(
+                "confidence",
+                0
+            ),
+
+            x.get(
+                "probability",
+                0
+            )
+
+        ),
+
+        reverse=True
+
+    )
+
+    return candidates[
+        :MAX_PREMATCH_SIGNALS_PER_SCAN
+    ]
+
+
+# =========================================================
+# PREMATCH SEND
+# =========================================================
+
+def send_prematch_signal(
+    signal
+):
+
+    fixture_id = signal.get(
+        "fixture_id"
+    )
+
+    market = signal.get(
+        "market"
+    )
+
+    if fixture_id is None:
+
+        return False
+
+    if signal_already_sent(
+        fixture_id,
+        market
+    ):
+
+        return False
+
+    try:
+
+        message = format_prematch_signal(
+            signal
+        )
+
+    except Exception as e:
+
+        logging.warning(
+
+            "PREMATCH FORMAT ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return False
+
+    if not send_telegram(
+        message
+    ):
+
+        return False
+
+    save_signal(
+        signal
+    )
+
+    remember_signal(
+        signal
+    )
+
+    return True
+
+
+# =========================================================
+# PREMATCH MASTER SCANNER
+# =========================================================
+
+def process_prematch_matches(
+    matches
+):
+
+    signals = get_best_prematch_signals(
+        matches
+    )
+
+    sent = 0
+
+    for signal in signals:
+
+        try:
+
+            if send_prematch_signal(
+                signal
+            ):
+
+                sent += 1
+
+        except Exception as e:
+
+            logging.warning(
+
+                "PREMATCH SEND ERROR: %s",
+
+                repr(e)
+
+            )
+
+    return sent
+
+
+# =========================================================
+# LIVE MASTER FILTER
+# =========================================================
+
+def live_signal_quality_filter(
+    signal
+):
+
+    if not signal:
+
+        return False
+
+    probability = signal.get(
+        "probability",
+        0
+    )
+
+    confidence = signal.get(
+        "confidence",
+        0
+    )
+
+    risk = signal.get(
+        "risk",
+        100
+    )
+
+    edge = signal.get(
+        "edge",
+        0
+    )
+
+    odd = signal.get(
+        "odd"
+    )
+
+    if probability < MIN_LIVE_PROBABILITY:
+
+        return False
+
+    if confidence < MIN_LIVE_CONFIDENCE:
+
+        return False
+
+    if risk > MAX_LIVE_RISK:
+
+        return False
+
+    if edge < 0:
+
+        return False
+
+    if odd is None:
+
+        return False
+
+    if odd < 1.30:
+
+        return False
+
+    if odd > 4.00:
+
+        return False
+
+    return True
+
+
+# =========================================================
+# LIVE CANDIDATE RANKING
+# =========================================================
+
+def rank_live_signals(
+    signals
+):
+
+    valid = []
+
+    for signal in signals:
+
+        if not live_signal_quality_filter(
+            signal
+        ):
+
+            continue
+
+        score = live_signal_score(
+
+            signal.get(
+                "probability",
+                0
+            ),
+
+            signal.get(
+                "confidence",
+                0
+            ),
+
+            signal.get(
+                "edge",
+                0
+            ),
+
+            signal.get(
+                "risk",
+                100
+            )
+
+        )
+
+        signal[
+            "score"
+        ] = score
+
+        valid.append(
+            signal
+        )
+
+    valid.sort(
+
+        key=lambda x: (
+
+            x.get(
+                "score",
+                0
+            ),
+
+            x.get(
+                "confidence",
+                0
+            ),
+
+            x.get(
+                "probability",
+                0
+            )
+
+        ),
+
+        reverse=True
+
+    )
+
+    return valid[
+        :MAX_LIVE_SIGNALS_PER_SCAN
+    ]
+
+
+# =========================================================
+# LIVE SCAN
+# =========================================================
+
+def scan_live():
+
+    try:
+
+        matches = get_live_matches()
+
+        if not matches:
+
+            return 0
+
+        candidates = []
+
+        for match in matches:
+
+            try:
+
+                signal = get_best_live_signal(
+                    match
+                )
+
+                if not signal:
+
+                    continue
+
+                candidates.append(
+                    signal
+                )
+
+            except Exception as e:
+
+                logging.warning(
+
+                    "LIVE MATCH ERROR: %s",
+
+                    repr(e)
+
+                )
+
+        candidates = rank_live_signals(
+            candidates
+        )
+
+        sent = 0
+
+        for signal in candidates:
+
+            try:
+
+                if send_live_signal(
+                    signal
+                ):
+
+                    remember_signal(
+                        signal
+                    )
+
+                    sent += 1
+
+            except Exception as e:
+
+                logging.warning(
+
+                    "LIVE SIGNAL ERROR: %s",
+
+                    repr(e)
+
+                )
+
+        return sent
+
+    except Exception as e:
+
+        logging.warning(
+
+            "LIVE SCANNER ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return 0
+
+
+# =========================================================
+# PREMATCH DATA LOADER
+# =========================================================
+
+def get_prematch_matches():
+
+    try:
+
+        now = datetime.now(
+            TIMEZONE
+        )
+
+        date_string = now.strftime(
+            "%Y-%m-%d"
+        )
+
+        data = api_get(
+
+            "fixtures",
+
+            {
+
+                "date":
+                    date_string,
+
+                "timezone":
+                    str(
+                        TIMEZONE
+                    )
+
+            }
+
+        )
+
+        return data.get(
+            "response",
+            []
+        )
+
+    except Exception as e:
+
+        logging.warning(
+
+            "PREMATCH FIXTURES ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return []
+
+
+# =========================================================
+# REMOVE STARTED MATCHES
+# =========================================================
+
+def remove_started_matches(
+    matches
+):
+
+    result = []
+
+    for match in matches:
+
+        try:
+
+            status = match.get(
+                "fixture",
+                {}
+            ).get(
+                "status",
+                {}
+            ).get(
+                "short"
+            )
+
+            if status in (
+
+                "NS",
+                "TBD"
+
+            ):
+
+                result.append(
+                    match
+                )
+
+        except Exception:
+
+            continue
+
+    return result
+
+
+# =========================================================
+# PREMATCH SCAN
+# =========================================================
+
+def scan_prematch():
+
+    try:
+
+        matches = get_prematch_matches()
+
+        if not matches:
+
+            return 0
+
+        matches = remove_started_matches(
+            matches
+        )
+
+        if not matches:
+
+            return 0
+
+        return process_prematch_matches(
+            matches
+        )
+
+    except Exception as e:
+
+        logging.warning(
+
+            "PREMATCH SCAN ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return 0
+
+
+# =========================================================
+# API HEALTH CHECK
+# =========================================================
+
+def api_health_check():
+
+    try:
+
+        data = api_get(
+
+            "fixtures",
+
+            {
+
+                "live":
+                    "all"
+
+            }
+
+        )
+
+        if data is None:
+
+            return False
+
+        return True
+
+    except Exception as e:
+
+        logging.warning(
+
+            "API HEALTH ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return False
+
+
+# =========================================================
+# SYSTEM STATUS
+# =========================================================
+
+def print_system_status():
+
+    print()
+    print(
+        "=" * 60
+    )
+
+    print(
+        "🤖 AI FOOTBALL BOT V4"
+    )
+
+    print(
+        "STATUS: ONLINE"
+    )
+
+    print(
+        "LIVE:",
+        LIVE_SCAN_INTERVAL,
+        "sec"
+    )
+
+    print(
+        "PREMATCH:",
+        PREMATCH_SCAN_INTERVAL,
+        "sec"
+    )
+
+    print(
+        "LIVE CONFIDENCE:",
+        MIN_LIVE_CONFIDENCE
+    )
+
+    print(
+        "LIVE PROBABILITY:",
+        MIN_LIVE_PROBABILITY
+    )
+
+    print(
+        "LIVE MAX RISK:",
+        MAX_LIVE_RISK
+    )
+
+    print(
+        "MAX LIVE SIGNALS:",
+        MAX_LIVE_SIGNALS_PER_SCAN
+    )
+
+    print(
+        "MAX PREMATCH SIGNALS:",
+        MAX_PREMATCH_SIGNALS_PER_SCAN
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print()
+
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+def main_loop():
+
+    global LAST_PREMATCH_SCAN
+    global LAST_LIVE_SCAN
+
+    print_system_status()
+
+    if not api_health_check():
+
+        print(
+            "❌ API NOT AVAILABLE"
+        )
+
+        return
+
+    print(
+        "✅ API CONNECTION OK"
+    )
+
+    print()
+
     while True:
 
         now = time.time()
 
-        # limit сигнали (макс 6 на 10 мин)
-        last_signals[:] = [t for t in last_signals if now - t < 600]
-        if len(last_signals) >= 6:
-            await asyncio.sleep(30)
-            continue
+        # =============================================
+        # CLEAN MEMORY
+        # =============================================
 
-        matches = get_live()
+        cleanup_signal_memory()
 
-        for m in matches:
+        # =============================================
+        # LIVE SCAN
+        # =============================================
 
-            fid = m["fixture"]["id"]
+        if (
 
-            # anti-spam (3 мин)
-            if fid in sent_matches and now - sent_matches[fid] < 180:
-                continue
+            now
+            -
+            LAST_LIVE_SCAN
 
-            minute = m["fixture"]["status"]["elapsed"] or 0
-            if minute < 5:
-                continue
+            >=
 
-            stats = get_stats(fid)
+            LIVE_SCAN_INTERVAL
 
-            result = ai_engine(m, stats)
-            if not result:
-                continue
+        ):
 
-            score, pick = result
+            print(
+                datetime.now(
+                    TIMEZONE
+                ).strftime(
+                    "%H:%M:%S"
+                ),
 
-            if not should_play(score):
-                continue
+                "LIVE SCAN"
+            )
 
-            stake = calculate_stake(score)
+            live_sent = scan_live()
 
-            home = m["teams"]["home"]["name"]
-            away = m["teams"]["away"]["name"]
+            print(
 
-            msg = f"{home} vs {away}\n{pick}\n{score}%\nStake: {stake} лв"
+                "LIVE SIGNALS SENT:",
 
-            try:
-                await bot.send_message(chat_id=CHAT_ID, text=msg)
-                print("SENT:", msg)
+                live_sent
 
-                sent_matches[fid] = now
-                last_signals.append(now)
+            )
 
-            except Exception as e:
-                print("ERROR:", e)
+            LAST_LIVE_SCAN = now
 
-        await asyncio.sleep(30)
+        # =============================================
+        # PREMATCH SCAN
+        # =============================================
 
-# ===== RUN =====
-def run_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+        if (
 
-    app.add_handler(CommandHandler("safe_mode", safe_mode))
-    app.add_handler(CommandHandler("aggressive_mode", aggressive_mode))
+            now
+            -
+            LAST_PREMATCH_SCAN
 
-    threading.Thread(target=lambda: asyncio.run(monitor())).start()
+            >=
 
-print("🔥 V3 LIVE FIXED")
+            PREMATCH_SCAN_INTERVAL
 
-app.run_polling()
+        ):
+
+            print(
+                datetime.now(
+                    TIMEZONE
+                ).strftime(
+                    "%H:%M:%S"
+                ),
+
+                "PREMATCH SCAN"
+            )
+
+            prematch_sent = scan_prematch()
+
+            print(
+
+                "PREMATCH SIGNALS SENT:",
+
+                prematch_sent
+
+            )
+
+            LAST_PREMATCH_SCAN = now
+
+        # =============================================
+        # SLEEP
+        # =============================================
+
+        time.sleep(
+            5
+        )
+
+
+# =========================================================
+# START BOT
+# =========================================================
 
 if __name__ == "__main__":
-    run_bot()
-# update v2
-# fix update
+
+    try:
+
+        main_loop()
+
+    except KeyboardInterrupt:
+
+        print()
+
+        print(
+            "🛑 BOT STOPPED"
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            "FATAL MAIN ERROR: %s",
+            repr(e)
+        )
+
+# =========================================================
+# LIVE ODDS HISTORY V4
+# =========================================================
+
+ODDS_HISTORY_CACHE = {}
+
+ODDS_HISTORY_INTERVAL = 30
+
+
+# =========================================================
+# DATABASE - ODDS HISTORY
+# =========================================================
+
+def init_odds_history_database():
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_NAME
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS odds_history(
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                fixture_id INTEGER,
+
+                market TEXT,
+
+                odd REAL,
+
+                minute INTEGER,
+
+                home_goals INTEGER,
+
+                away_goals INTEGER,
+
+                created_at TEXT
+
+            )
+        """)
+
+        conn.commit()
+
+        conn.close()
+
+    except Exception as e:
+
+        logging.warning(
+            "ODDS HISTORY DB ERROR: %s",
+            repr(e)
+        )
+
+
+# =========================================================
+# SAVE ODDS SNAPSHOT
+# =========================================================
+
+def save_odds_snapshot(
+    fixture_id,
+    market,
+    odd,
+    minute,
+    home_goals,
+    away_goals
+):
+
+    if odd is None:
+
+        return False
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_NAME
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO odds_history(
+
+                fixture_id,
+                market,
+                odd,
+                minute,
+                home_goals,
+                away_goals,
+                created_at
+
+            )
+
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+
+            (
+
+                fixture_id,
+                market,
+                odd,
+                minute,
+                home_goals,
+                away_goals,
+
+                datetime.now(
+                    TIMEZONE
+                ).isoformat()
+
+            )
+
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        return True
+
+    except Exception as e:
+
+        logging.warning(
+            "ODDS SNAPSHOT ERROR: %s",
+            repr(e)
+        )
+
+        return False
+
+
+# =========================================================
+# GET ODDS HISTORY
+# =========================================================
+
+def get_odds_history(
+    fixture_id,
+    market
+):
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_NAME
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                odd,
+                minute,
+                home_goals,
+                away_goals,
+                created_at
+
+            FROM odds_history
+
+            WHERE fixture_id=?
+            AND market=?
+
+            ORDER BY id ASC
+            """,
+
+            (
+                fixture_id,
+                market
+            )
+
+        )
+
+        rows = cursor.fetchall()
+
+        conn.close()
+
+        return rows
+
+    except Exception as e:
+
+        logging.warning(
+            "GET ODDS HISTORY ERROR: %s",
+            repr(e)
+        )
+
+        return []
+
+
+# =========================================================
+# FIRST ODDS
+# =========================================================
+
+def get_opening_live_odd(
+    fixture_id,
+    market
+):
+
+    history = get_odds_history(
+        fixture_id,
+        market
+    )
+
+    if not history:
+
+        return None
+
+    return safe_float(
+        history[0][0]
+    )
+
+
+# =========================================================
+# LAST ODDS
+# =========================================================
+
+def get_current_recorded_odd(
+    fixture_id,
+    market
+):
+
+    history = get_odds_history(
+        fixture_id,
+        market
+    )
+
+    if not history:
+
+        return None
+
+    return safe_float(
+        history[-1][0]
+    )
+
+
+# =========================================================
+# ODDS MOVEMENT
+# =========================================================
+
+def calculate_odds_movement(
+    opening_odd,
+    current_odd
+):
+
+    if (
+
+        opening_odd is None
+
+        or
+
+        current_odd is None
+
+        or
+
+        opening_odd <= 1.01
+
+    ):
+
+        return 0
+
+    movement = (
+
+        (
+            opening_odd
+            -
+            current_odd
+        )
+
+        /
+
+        opening_odd
+
+    ) * 100
+
+    return round(
+        movement,
+        2
+    )
+
+
+# =========================================================
+# ODDS TREND
+# =========================================================
+
+def odds_trend(
+    movement
+):
+
+    if movement >= 10:
+
+        return "🔥 VERY STRONG SUPPORT"
+
+    if movement >= 6:
+
+        return "🔥 STRONG SUPPORT"
+
+    if movement >= 3:
+
+        return "⭐ SUPPORT"
+
+    if movement <= -10:
+
+        return "⚠ VERY STRONG AGAINST"
+
+    if movement <= -6:
+
+        return "⚠ STRONG AGAINST"
+
+    if movement <= -3:
+
+        return "⚠ AGAINST"
+
+    return "NEUTRAL"
+
+
+# =========================================================
+# RECORD LIVE ODDS
+# =========================================================
+
+def record_live_odds(
+    match
+):
+
+    try:
+
+        fixture = match.get(
+            "fixture",
+            {}
+        )
+
+        fixture_id = fixture.get(
+            "id"
+        )
+
+        minute = fixture.get(
+            "status",
+            {}
+        ).get(
+            "elapsed"
+        )
+
+        if fixture_id is None:
+
+            return
+
+        if minute is None:
+
+            return
+
+        teams = match.get(
+            "teams",
+            {}
+        )
+
+        home_team = teams.get(
+            "home",
+            {}
+        ).get(
+            "name",
+            "HOME"
+        )
+
+        away_team = teams.get(
+            "away",
+            {}
+        ).get(
+            "name",
+            "AWAY"
+        )
+
+        goals = match.get(
+            "goals",
+            {}
+        )
+
+        home_goals = goals.get(
+            "home"
+        )
+
+        away_goals = goals.get(
+            "away"
+        )
+
+        live_odds = parse_live_next_goal_odds(
+
+            fixture_id,
+
+            home_team,
+
+            away_team
+
+        )
+
+        if not live_odds:
+
+            return
+
+        # =============================================
+        # HOME
+        # =============================================
+
+        home_odd = live_odds.get(
+            "home"
+        )
+
+        if home_odd is not None:
+
+            save_odds_snapshot(
+
+                fixture_id,
+
+                "🎯 NEXT GOAL HOME",
+
+                home_odd,
+
+                minute,
+
+                home_goals or 0,
+
+                away_goals or 0
+
+            )
+
+        # =============================================
+        # AWAY
+        # =============================================
+
+        away_odd = live_odds.get(
+            "away"
+        )
+
+        if away_odd is not None:
+
+            save_odds_snapshot(
+
+                fixture_id,
+
+                "🎯 NEXT GOAL AWAY",
+
+                away_odd,
+
+                minute,
+
+                home_goals or 0,
+
+                away_goals or 0
+
+            )
+
+    except Exception as e:
+
+        logging.warning(
+            "RECORD LIVE ODDS ERROR: %s",
+            repr(e)
+        )
+
+
+# =========================================================
+# GET MARKET MOVEMENT FOR SIGNAL
+# =========================================================
+
+def enrich_signal_with_odds_history(
+    signal
+):
+
+    try:
+
+        fixture_id = signal.get(
+            "fixture_id"
+        )
+
+        market = signal.get(
+            "market"
+        )
+
+        current_odd = signal.get(
+            "odd"
+        )
+
+        if (
+
+            fixture_id is None
+
+            or
+
+            market is None
+
+        ):
+
+            return signal
+
+        opening_odd = get_opening_live_odd(
+
+            fixture_id,
+
+            market
+
+        )
+
+        if opening_odd is None:
+
+            signal[
+                "opening_odd"
+            ] = current_odd
+
+            signal[
+                "odds_movement"
+            ] = 0
+
+            signal[
+                "odds_trend"
+            ] = "NEW MARKET"
+
+            return signal
+
+        movement = calculate_odds_movement(
+
+            opening_odd,
+
+            current_odd
+
+        )
+
+        signal[
+            "opening_odd"
+        ] = opening_odd
+
+        signal[
+            "odds_movement"
+        ] = movement
+
+        signal[
+            "odds_trend"
+        ] = odds_trend(
+            movement
+        )
+
+        # =============================================
+        # SMALL QUALITY BONUS
+        # =============================================
+
+        if movement >= 6:
+
+            signal[
+                "confidence"
+            ] = round(
+
+                min(
+                    95,
+                    signal.get(
+                        "confidence",
+                        0
+                    ) + 2
+                ),
+
+                1
+
+            )
+
+        elif movement >= 3:
+
+            signal[
+                "confidence"
+            ] = round(
+
+                min(
+                    95,
+                    signal.get(
+                        "confidence",
+                        0
+                    ) + 1
+                ),
+
+                1
+
+            )
+
+        elif movement <= -6:
+
+            signal[
+                "confidence"
+            ] = round(
+
+                max(
+                    0,
+                    signal.get(
+                        "confidence",
+                        0
+                    ) - 3
+                ),
+
+                1
+
+            )
+
+        return signal
+
+    except Exception as e:
+
+        logging.warning(
+            "ODDS ENRICH ERROR: %s",
+            repr(e)
+        )
+
+        return signal
+
+
+# =========================================================
+# RESULT CHECKER
+# =========================================================
+
+def get_fixture_result(
+    fixture_id
+):
+
+    try:
+
+        data = api_get(
+
+            "fixtures",
+
+            {
+                "id":
+                    fixture_id
+            }
+
+        )
+
+        response = data.get(
+            "response",
+            []
+        )
+
+        if not response:
+
+            return None
+
+        fixture = response[0]
+
+        status = fixture.get(
+            "fixture",
+            {}
+        ).get(
+            "status",
+            {}
+        ).get(
+            "short"
+        )
+
+        if status not in (
+
+            "FT",
+            "AET",
+            "PEN"
+
+        ):
+
+            return None
+
+        goals = fixture.get(
+            "goals",
+            {}
+        )
+
+        home = goals.get(
+            "home"
+        )
+
+        away = goals.get(
+            "away"
+        )
+
+        if (
+
+            home is None
+
+            or
+
+            away is None
+
+        ):
+
+            return None
+
+        return {
+
+            "home":
+                home,
+
+            "away":
+                away,
+
+            "status":
+                status
+
+        }
+
+    except Exception as e:
+
+        logging.warning(
+            "RESULT ERROR: %s",
+            repr(e)
+        )
+
+        return None
+
+
+# =========================================================
+# CHECK NEXT GOAL RESULT
+# =========================================================
+
+def check_next_goal_result(
+    signal
+):
+
+    fixture_id = signal.get(
+        "fixture_id"
+    )
+
+    market = signal.get(
+        "market"
+    )
+
+    if fixture_id is None:
+
+        return None
+
+    result = get_fixture_result(
+        fixture_id
+    )
+
+    if result is None:
+
+        return None
+
+    history = get_odds_history(
+
+        fixture_id,
+
+        market
+
+    )
+
+    if not history:
+
+        return None
+
+    signal_minute = signal.get(
+        "minute",
+        0
+    )
+
+    signal_home_goals = history[-1][2]
+    signal_away_goals = history[-1][3]
+
+    # =============================================
+    # GET EVENTS
+    # =============================================
+
+    data = api_get(
+
+        "fixtures/events",
+
+        {
+            "fixture":
+                fixture_id
+        }
+
+    )
+
+    events = data.get(
+        "response",
+        []
+    )
+
+    next_goal = None
+
+    for event in events:
+
+        event_type = clean_text(
+            event.get(
+                "type"
+            )
+        )
+
+        detail = clean_text(
+            event.get(
+                "detail"
+            )
+        )
+
+        elapsed = event.get(
+            "time",
+            {}
+        ).get(
+            "elapsed"
+        )
+
+        if event_type != "goal":
+
+            continue
+
+        if elapsed is None:
+
+            continue
+
+        if elapsed <= signal_minute:
+
+            continue
+
+        team_id = event.get(
+            "team",
+            {}
+        ).get(
+            "id"
+        )
+
+        teams = signal.get(
+            "teams",
+            {}
+        )
+
+        home_id = teams.get(
+            "home",
+            {}
+        ).get(
+            "id"
+        )
+
+        away_id = teams.get(
+            "away",
+            {}
+        ).get(
+            "id"
+        )
+
+        if team_id == home_id:
+
+            next_goal = "HOME"
+
+        elif team_id == away_id:
+
+            next_goal = "AWAY"
+
+        if next_goal:
+
+            break
+
+    # =============================================
+    # NO LATER GOAL
+    # =============================================
+
+    if next_goal is None:
+
+        return "LOSS"
+
+    # =============================================
+    # CHECK MARKET
+    # =============================================
+
+    if market == "🎯 NEXT GOAL HOME":
+
+        if next_goal == "HOME":
+
+            return "WIN"
+
+        return "LOSS"
+
+    if market == "🎯 NEXT GOAL AWAY":
+
+        if next_goal == "AWAY":
+
+            return "WIN"
+
+        return "LOSS"
+
+    return None
+
+
+# =========================================================
+# UPDATE SIGNAL RESULT
+# =========================================================
+
+def update_signal_result(
+    signal_id,
+    result
+):
+
+    if result not in (
+        "WIN",
+        "LOSS"
+    ):
+
+        return False
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_NAME
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+
+            """
+            UPDATE signals
+
+            SET result=?
+
+            WHERE id=?
+
+            """,
+
+            (
+                result,
+                signal_id
+            )
+
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        return True
+
+    except Exception as e:
+
+        logging.warning(
+            "RESULT UPDATE ERROR: %s",
+            repr(e)
+        )
+
+        return False
+
+
+# =========================================================
+# CHECK PENDING SIGNALS
+# =========================================================
+
+def check_pending_signals():
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_NAME
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                fixture_id,
+                home_team,
+                away_team,
+                market,
+                probability,
+                odd,
+                confidence,
+                created_at
+
+            FROM signals
+
+            WHERE result IS NULL
+
+            ORDER BY id ASC
+
+            LIMIT 50
+            """
+        )
+
+        rows = cursor.fetchall()
+
+        conn.close()
+
+        checked = 0
+
+        for row in rows:
+
+            (
+
+                signal_id,
+                fixture_id,
+                home_team,
+                away_team,
+                market,
+                probability,
+                odd,
+                confidence,
+                created_at
+
+            ) = row
+
+            # =========================================
+            # ONLY NEXT GOAL FOR NOW
+            # =========================================
+
+            if market not in (
+
+                "🎯 NEXT GOAL HOME",
+
+                "🎯 NEXT GOAL AWAY"
+
+            ):
+
+                continue
+
+            signal = {
+
+                "fixture_id":
+                    fixture_id,
+
+                "home_team":
+                    home_team,
+
+                "away_team":
+                    away_team,
+
+                "market":
+                    market,
+
+                "probability":
+                    probability,
+
+                "odd":
+                    odd,
+
+                "confidence":
+                    confidence,
+
+                "created_at":
+                    created_at,
+
+                "teams": {
+
+                    "home": {},
+                    "away": {}
+
+                }
+
+            }
+
+            result = check_next_goal_result(
+                signal
+            )
+
+            if result is None:
+
+                continue
+
+            if update_signal_result(
+
+                signal_id,
+
+                result
+
+            ):
+
+                checked += 1
+
+                print(
+
+                    "RESULT:",
+
+                    home_team,
+
+                    "-",
+
+                    away_team,
+
+                    market,
+
+                    result
+
+                )
+
+        return checked
+
+    except Exception as e:
+
+        logging.warning(
+
+            "PENDING SIGNAL CHECK ERROR: %s",
+
+            repr(e)
+
+        )
+
+        return 0
+
+
+# =========================================================
+# PERFORMANCE REPORT
+# =========================================================
+
+def get_performance_report():
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_NAME
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                market,
+                COUNT(*),
+                SUM(
+                    CASE
+                        WHEN result='WIN'
+                        THEN 1
+                        ELSE 0
+                    END
+                )
+
+            FROM signals
+
+            WHERE result IS NOT NULL
+
+            GROUP BY market
+
+            ORDER BY
+                COUNT(*) DESC
+            """
+        )
+
+        rows = cursor.fetchall()
+
+        conn.close()
+
+        report = []
+
+        for row in rows:
+
+            market = row[0]
+
+            total = row[1]
+
+            wins = row[2] or 0
+
+            if total <= 0:
+
+                continue
+
+            winrate = round(
+
+                wins
+                *
+                100
+                /
+                total,
+
+                1
+
+            )
+
+            report.append({
+
+                "market":
+                    market,
+
+                "signals":
+                    total,
+
+                "wins":
+                    wins,
+
+                "losses":
+                    total - wins,
+
+                "winrate":
+                    winrate
+
+            })
+
+        return report
+
+    except Exception as e:
+
+        logging.warning(
+            "PERFORMANCE ERROR: %s",
+            repr(e)
+        )
+
+        return []
+
+
+# =========================================================
+# PRINT PERFORMANCE
+# =========================================================
+
+def print_performance_report():
+
+    report = get_performance_report()
+
+    print()
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "📊 AI PERFORMANCE"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    if not report:
+
+        print(
+            "No completed signals yet."
+        )
+
+        print(
+            "=" * 60
+        )
+
+        return
+
+    for row in report:
+
+        print(
+
+            row["market"],
+
+            "|",
+
+            row["winrate"],
+
+            "%",
+
+            "|",
+
+            row["wins"],
+
+            "/",
+
+            row["signals"]
+
+        )
+
+    print(
+        "=" * 60
+    )
+
+
+# =========================================================
+# DATABASE STARTUP
+# =========================================================
+
+def initialize_all_databases():
+
+    init_database()
+
+    init_odds_history_database()
+
+
+# =========================================================
+# FINAL STARTUP
+# =========================================================
+
+def startup():
+
+    initialize_all_databases()
+
+    print()
+
+    print(
+        "=============================================="
+    )
+
+    print(
+        "🤖 AI FOOTBALL SYSTEM V4"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    print(
+        "Database ............ OK"
+    )
+
+    print(
+        "Odds History ........ OK"
+    )
+
+    print(
+        "Signal Engine ....... OK"
+    )
+
+    print(
+        "Risk Engine ......... OK"
+    )
+
+    print(
+        "Live Scanner ........ OK"
+    )
+
+    print(
+        "Prematch Scanner .... OK"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    print()
+
+
+# =========================================================
+# START
+# =========================================================
+
+if __name__ == "__main__":
+
+    startup()
+
+    main_loop()
+
